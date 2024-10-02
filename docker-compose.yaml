@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  browserless:
+    image: ghcr.io/browserless/chromium
+    environment:
+      - TOKEN=random-token
+      - CONCURRENT=10
+    ports:
+      - "3000:3000"

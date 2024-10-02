@@ -1,0 +1,14 @@
+{
+  "name": "visual-testing",
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "jimp": "^0.16.13",
+    "p-limit": "^3.1.0",
+    "pixelmatch": "^5.3.0",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/pngjs": "6.0.5",
+    "@types/pixelmatch": "5.2.6"
+  }
+}
