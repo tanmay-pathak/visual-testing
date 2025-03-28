@@ -9,6 +9,7 @@ import { chromium } from "@playwright/test";
 
 export const SCREENSHOTS_DIR = "screenshots";
 export const CHANGES_DIR = "changes";
+export const ERROR_LOG_FILE = "error.log";
 export const PIXELMATCH_THRESHOLD = 0.1;
 export const DEFAULT_VIEWPORT_WIDTH = 1700;
 export const DEFAULT_VIEWPORT_HEIGHT = 1080;
@@ -35,27 +36,32 @@ export async function takeScreenshot(
   page: Page,
   url: string,
   width: number = DEFAULT_VIEWPORT_WIDTH,
-  waitForLazyLoading: boolean = false
+  waitForLazyLoading: boolean = false,
 ): Promise<Buffer> {
-  await page.setViewportSize({ width, height: DEFAULT_VIEWPORT_HEIGHT });
+  try {
+    await page.setViewportSize({ width, height: DEFAULT_VIEWPORT_HEIGHT });
 
-  // Enable reduced motion before navigating to the page
-  await page.emulateMedia({ reducedMotion: "reduce" });
+    // Enable reduced motion before navigating to the page
+    await page.emulateMedia({ reducedMotion: "reduce" });
 
-  await page.goto(url);
+    await page.goto(url);
 
-  if (waitForLazyLoading) {
-    // Wait for any lazy loaded content
-    await page.waitForTimeout(1000);
+    if (waitForLazyLoading) {
+      // Wait for any lazy loaded content
+      await page.waitForTimeout(1000);
 
-    // Scroll to bottom and back to top to ensure all lazy content loads
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(500);
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(500);
+      // Scroll to bottom and back to top to ensure all lazy content loads
+      await page.evaluate(() => globalThis.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(500);
+      await page.evaluate(() => globalThis.scrollTo(0, 0));
+      await page.waitForTimeout(500);
+    }
+
+    return await page.screenshot(SCREENSHOT_OPTIONS);
+  } catch (error) {
+    logError(`Error taking screenshot for URL ${url}`, error);
+    throw error; // Re-throw to allow caller to handle
   }
-
-  return await page.screenshot(SCREENSHOT_OPTIONS);
 }
 
 /**
@@ -68,7 +74,7 @@ export async function takeScreenshot(
 export async function compareScreenshots(
   oldImage: Buffer,
   newImage: Buffer,
-  handleDifferentSizes: boolean = false
+  handleDifferentSizes: boolean = false,
 ): Promise<number> {
   if (handleDifferentSizes) {
     // Use Jimp to resize images if they don't match
@@ -92,10 +98,10 @@ export async function compareScreenshots(
 
       // Convert back to PNG for comparison
       const oldResized = PNG.sync.read(
-        await oldJimp.getBufferAsync(Jimp.MIME_PNG)
+        await oldJimp.getBufferAsync(Jimp.MIME_PNG),
       );
       const newResized = PNG.sync.read(
-        await newJimp.getBufferAsync(Jimp.MIME_PNG)
+        await newJimp.getBufferAsync(Jimp.MIME_PNG),
       );
 
       // Create diff using resized images
@@ -107,7 +113,7 @@ export async function compareScreenshots(
         diff.data,
         maxWidth,
         maxHeight,
-        { threshold: PIXELMATCH_THRESHOLD }
+        { threshold: PIXELMATCH_THRESHOLD },
       );
     }
   }
@@ -134,7 +140,7 @@ export async function createDiffImageWithPath(
   oldImage: Buffer,
   newImage: Buffer,
   filename: string,
-  outputDir: string
+  outputDir: string,
 ): Promise<void> {
   // Create the output directory if it doesn't exist
   if (!fs.existsSync(outputDir)) {
@@ -198,10 +204,26 @@ export async function createDiffImageWithPath(
 export async function createDiffImage(
   oldImage: Buffer,
   newImage: Buffer,
-  filename: string
+  filename: string,
 ): Promise<void> {
   // Use the createDiffImageWithPath function with the default CHANGES_DIR
   await createDiffImageWithPath(oldImage, newImage, filename, CHANGES_DIR);
+}
+
+/**
+ * Logs error to both console and error log file
+ * @param message - Error message to log
+ * @param error - Error object
+ */
+// deno-lint-ignore no-explicit-any
+export function logError(message: string, error: any): void {
+  const timestamp = new Date().toISOString();
+  const errorMessage = `[${timestamp}] ${message}: ${error}\n`;
+
+  console.error(errorMessage);
+
+  // Append to error log file
+  fs.appendFileSync(ERROR_LOG_FILE, errorMessage);
 }
 
 /**
@@ -212,14 +234,14 @@ export async function createDiffImage(
  */
 export function transformUrl(
   originalUrl: string,
-  newBaseDomain: string | null
+  newBaseDomain: string | null,
 ): string {
   if (!newBaseDomain) return originalUrl;
   try {
     const url = new URL(originalUrl);
     return originalUrl.replace(url.origin, `https://${newBaseDomain}`);
   } catch (error) {
-    console.error(`Error transforming URL ${originalUrl}:`, error);
+    logError(`Error transforming URL ${originalUrl}`, error);
     return originalUrl;
   }
 }
@@ -262,7 +284,7 @@ export async function createTestBrowser() {
 export function saveComparisonScreenshots(
   filename: string,
   screenshot1: Buffer,
-  screenshot2: Buffer
+  screenshot2: Buffer,
 ): { screenshot1Path: string; screenshot2Path: string } {
   const screenshot1Path = path.join(SCREENSHOTS_DIR, `${filename}_prod.png`);
   const screenshot2Path = path.join(SCREENSHOTS_DIR, `${filename}_preview.png`);
@@ -284,10 +306,10 @@ export function logComparisonResults(
   diffPixels: number,
   filename: string,
   screenshot1Path: string,
-  screenshot2Path: string
+  screenshot2Path: string,
 ): void {
   const diffPath = path.join(CHANGES_DIR, `${filename}_diff.png`);
-  
+
   if (diffPixels > 0) {
     console.log(`Visual differences detected: ${diffPixels} pixels different`);
     console.log(`Comparison saved to ${diffPath}`);
@@ -296,7 +318,9 @@ export function logComparisonResults(
     console.log(`Comparison saved to ${diffPath}`);
   }
 
-  console.log(`Screenshots saved to:\n1. ${screenshot1Path}\n2. ${screenshot2Path}`);
+  console.log(
+    `Screenshots saved to:\n1. ${screenshot1Path}\n2. ${screenshot2Path}`,
+  );
 }
 
 /**
@@ -308,7 +332,7 @@ export function logComparisonResults(
 export async function performUrlComparison(
   url1: string,
   url2: string,
-  viewportWidth: number = DEFAULT_VIEWPORT_WIDTH
+  viewportWidth: number = DEFAULT_VIEWPORT_WIDTH,
 ): Promise<void> {
   ensureDirectoriesExist();
 
@@ -332,23 +356,28 @@ export async function performUrlComparison(
       const { screenshot1Path, screenshot2Path } = saveComparisonScreenshots(
         filename,
         screenshot1,
-        screenshot2
+        screenshot2,
       );
 
       // Compare screenshots
       const diffPixels = await compareScreenshots(
         screenshot1,
         screenshot2,
-        true
+        true,
       );
 
       // Always create diff image regardless of pixel differences
       await createDiffImage(screenshot1, screenshot2, filename);
 
       // Log the results
-      logComparisonResults(diffPixels, filename, screenshot1Path, screenshot2Path);
+      logComparisonResults(
+        diffPixels,
+        filename,
+        screenshot1Path,
+        screenshot2Path,
+      );
     } catch (error) {
-      console.error(`Error comparing URLs:`, error);
+      logError(`Error comparing URLs`, error);
     } finally {
       await page.close();
     }

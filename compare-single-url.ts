@@ -1,7 +1,7 @@
 import process from "node:process";
 import {
   DEFAULT_VIEWPORT_WIDTH,
-  performUrlComparison
+  performUrlComparison,
 } from "./visual-testing-utils.ts";
 
 /**
@@ -15,17 +15,16 @@ async function main() {
   const url1 = args[0];
   const url2 = args[1];
   // Check if third argument is a number for width
-  const viewportWidth =
-    args[2] && !isNaN(Number(args[2]))
-      ? Number(args[2])
-      : DEFAULT_VIEWPORT_WIDTH;
+  const viewportWidth = args[2] && !isNaN(Number(args[2]))
+    ? Number(args[2])
+    : DEFAULT_VIEWPORT_WIDTH;
 
   if (!url1 || !url2) {
     console.error(
-      "Please provide two URLs to compare as command-line arguments."
+      "Please provide two URLs to compare as command-line arguments.",
     );
     console.error(
-      "Example: npx ts-node compare-single-url.ts https://zu.com/about https://deploy-preview-198--zuc-web.netlify.app/about [width]"
+      "Example: npx ts-node compare-single-url.ts https://zu.com/about https://deploy-preview-198--zuc-web.netlify.app/about [width]",
     );
     process.exit(1);
   }

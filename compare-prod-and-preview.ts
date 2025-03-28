@@ -1,20 +1,16 @@
-import { Browser, chromium } from "@playwright/test";
-import fs from "node:fs";
+import { Browser } from "@playwright/test";
 import pLimit from "p-limit";
 import * as cheerio from "cheerio";
 import process from "node:process";
 import {
-  urlToFilename,
-  takeScreenshot,
   compareScreenshots,
   createDiffImage,
-  transformUrl,
-  ensureDirectoriesExist,
-  SCREENSHOTS_DIR,
   createTestBrowser,
+  ensureDirectoriesExist,
   saveComparisonScreenshots,
-  logComparisonResults,
-  performUrlComparison,
+  takeScreenshot,
+  transformUrl,
+  urlToFilename,
 } from "./visual-testing-utils.ts";
 
 const CONCURRENCY_LIMIT = 20;
@@ -29,7 +25,7 @@ async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
     console.log(`Fetching sitemap from ${sitemapUrl}...`);
 
     // Use Deno.Command to use curl with SSL certificate bypass
-    // @ts-expect-error
+    // @ts-expect-error: Deno stuff.
     const command = new Deno.Command("curl", {
       args: [
         "-k", // Ignore SSL certificate errors
@@ -83,17 +79,19 @@ async function runVisualTest(
   previewDomain: string,
   browser: Browser
 ) {
-  const page = await browser.newPage();
+  const prodPage = await browser.newPage();
+  const previewPage = await browser.newPage();
+
   try {
     const filename = urlToFilename(prodUrl);
     const previewUrl = transformUrl(prodUrl, previewDomain);
 
-    // Take screenshots of both URLs
-    const prodScreenshot = await takeScreenshot(page, prodUrl);
-    const previewScreenshot = await takeScreenshot(page, previewUrl);
+    const [prodScreenshot, previewScreenshot] = await Promise.all([
+      takeScreenshot(prodPage, prodUrl),
+      takeScreenshot(previewPage, previewUrl),
+    ]);
 
-    // Save both screenshots
-    const { screenshot1Path, screenshot2Path } = saveComparisonScreenshots(
+    saveComparisonScreenshots(
       filename,
       prodScreenshot,
       previewScreenshot
@@ -105,11 +103,9 @@ async function runVisualTest(
       previewScreenshot
     );
 
-    // Always create diff image regardless of pixel differences
-    await createDiffImage(prodScreenshot, previewScreenshot, filename);
-
-    // Log the results
+    // Create diff image only if differences are detected
     if (diffPixels > 0) {
+      await createDiffImage(prodScreenshot, previewScreenshot, filename);
       console.log(
         `Visual changes detected between prod and preview for ${prodUrl}: ${diffPixels} pixels different`
       );
@@ -117,7 +113,7 @@ async function runVisualTest(
   } catch (error) {
     console.error(`Error running visual test for ${prodUrl}:`, error);
   } finally {
-    await page.close();
+    await Promise.all([prodPage.close(), previewPage.close()]);
   }
 }
 

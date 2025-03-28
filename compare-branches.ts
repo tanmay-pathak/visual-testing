@@ -5,12 +5,11 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 import os from "node:os";
 import {
-  takeScreenshot,
   compareScreenshots,
-  createDiffImage,
-  createTestBrowser,
-  urlToFilename,
   createDiffImageWithPath,
+  createTestBrowser,
+  takeScreenshot,
+  urlToFilename,
 } from "./visual-testing-utils.ts";
 
 const BASE_DIR = path.join(os.homedir(), "visual-testing-compare");
@@ -20,7 +19,7 @@ const CHANGES_DIR = path.join(BASE_DIR, "changes");
 async function runVisualTest(
   url: string,
   browser: Browser,
-  isBaseline: boolean
+  isBaseline: boolean,
 ) {
   const page = await browser.newPage();
 
@@ -34,17 +33,22 @@ async function runVisualTest(
 
     if (diffPixels > 0) {
       console.log(
-        `Visual changes detected for ${url}: ${diffPixels} pixels different`
+        `Visual changes detected for ${url}: ${diffPixels} pixels different`,
       );
-      
+
       // Use the custom changes directory in the user's home folder
-      await createDiffImageWithPath(oldScreenshot, newScreenshot, filename, CHANGES_DIR);
+      await createDiffImageWithPath(
+        oldScreenshot,
+        newScreenshot,
+        filename,
+        CHANGES_DIR,
+      );
     } else {
       console.log(`No visual changes detected for ${url}`);
     }
   } else {
     console.log(
-      `Taking ${isBaseline ? "baseline" : "new"} screenshot for ${url}`
+      `Taking ${isBaseline ? "baseline" : "new"} screenshot for ${url}`,
     );
   }
 
@@ -86,7 +90,7 @@ async function main() {
   const [url, branchName] = process.argv.slice(2);
   if (!url || !branchName) {
     console.error(
-      "Please provide both a URL and branch name as command-line arguments."
+      "Please provide both a URL and branch name as command-line arguments.",
     );
     process.exit(1);
   }

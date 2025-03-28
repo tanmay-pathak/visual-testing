@@ -1,0 +1,2 @@
+- Install `npx playwright install`
+- Install deno `brew install deno`
