@@ -1,0 +1,31 @@
+version: '3'
+
+services:
+  browserless:
+    image: ghcr.io/browserless/chromium
+    environment:
+      - TOKEN=6R0W53R135510
+      - CONCURRENT=10
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  visual-testing:
+    build: .
+    volumes:
+      - ./screenshots:/app/screenshots
+      - ./changes:/app/changes
+      - ./:/app
+    environment:
+      - BROWSERLESS_URL=ws://browserless:3000
+      - BROWSERLESS_TOKEN=6R0W53R135510
+      - SITEMAP_URL=https://zu.com/sitemap-0.xml
+      - CONCURRENT=10
+      - PREVIEW_DOMAIN=${PREVIEW_DOMAIN}
+    depends_on:
+      browserless:
+        condition: service_started
+    command: ${PREVIEW_DOMAIN}

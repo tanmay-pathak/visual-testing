@@ -264,14 +264,19 @@ export function ensureDirectoriesExist(): void {
  * @returns A Promise that resolves to the browser instance
  */
 export async function createTestBrowser() {
-  return await chromium.launch({
-    args: [
-      "--ignore-certificate-errors",
-      "--ignore-certificate-errors-spki-list",
-      "--ignore-ssl-errors",
-      "--disable-web-security",
-    ],
-  });
+  // Check if BROWSERLESS_URL environment variable is set (for Docker)
+  const browserlessUrl = process.env.BROWSERLESS_URL || 'ws://localhost:3000';
+  const browserlessToken = process.env.BROWSERLESS_TOKEN || '6R0W53R135510';
+  
+  const wsEndpoint = `${browserlessUrl}?token=${browserlessToken}`;
+  console.log(`Connecting to browserless at ${wsEndpoint}`);
+  
+  try {
+    return await chromium.connectOverCDP(wsEndpoint);
+  } catch (error) {
+    console.error(`Failed to connect to browserless: ${error}`);
+    throw error;
+  }
 }
 
 /**

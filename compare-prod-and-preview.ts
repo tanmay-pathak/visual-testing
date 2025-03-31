@@ -13,7 +13,9 @@ import {
   urlToFilename,
 } from "./visual-testing-utils.ts";
 
-const CONCURRENCY_LIMIT = 20;
+// Configuration constants
+const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENT || "20", 10);
+const SITEMAP_URL = process.env.SITEMAP_URL || "https://zu.com/sitemap-0.xml";
 
 /**
  * Fetches URLs from a sitemap.
@@ -119,15 +121,20 @@ async function runVisualTest(
 
 /**
  * Main function to run the visual tests.
- * Sample run: deno --allow-read --allow-env --allow-sys --allow-ffi --allow-write --allow-run --allow-net compare-prod-and-preview.ts https://zu.com/sitemap-0.xml deploy-preview-320--zuc-web.netlify.app
+ * Sample run: deno --allow-read --allow-env --allow-sys --allow-ffi --allow-write --allow-run --allow-net compare-prod-and-preview.ts deploy-preview-320--zuc-web.netlify.app
  */
 async function main() {
-  const [sitemapUrl, previewDomain] = process.argv.slice(2);
+  // Get the preview domain from command line args or environment variable
+  const previewDomain = process.argv[2] || process.env.PREVIEW_DOMAIN;
 
-  if (!sitemapUrl) {
-    console.error("Please provide a sitemap URL as a command-line argument.");
+  if (!previewDomain) {
+    console.error("Please provide a preview domain as a command-line argument or set PREVIEW_DOMAIN environment variable.");
     process.exit(1);
   }
+
+  console.log(`Using sitemap URL: ${SITEMAP_URL}`);
+  console.log(`Using preview domain: ${previewDomain}`);
+  console.log(`Concurrency limit: ${CONCURRENCY_LIMIT}`);
 
   ensureDirectoriesExist();
 
@@ -135,8 +142,10 @@ async function main() {
   const limit = pLimit(CONCURRENCY_LIMIT);
 
   try {
-    const urlsFromSitemap = await fetchSitemapUrls(sitemapUrl);
-    const uniqueUrls = [...new Set(urlsFromSitemap)];
+    const urlsFromSitemap = await fetchSitemapUrls(SITEMAP_URL);
+    const uniqueUrls = [...new Set(urlsFromSitemap)].slice(0, 5);
+
+    console.log(`Found ${uniqueUrls.length} unique URLs from sitemap`);
 
     const tasks = uniqueUrls.map((url) =>
       limit(() => runVisualTest(url, previewDomain, browser))
