@@ -68,6 +68,43 @@ export async function takeScreenshot(
         height: 2000,
       },
       scrollPage: true,
+      addScriptTag: [
+        {
+          content: `
+    // Force reduced motion styles and disable animations
+    const style = document.createElement('style');
+    style.innerHTML = '* { animation: none !important; transition: none !important; }';
+    style.innerHTML += '[data-aos], [data-scroll], [data-animation], [data-scroll-reveal], .reveal, .animated, .animate__animated { opacity: 1 !important; transform: none !important; visibility: visible !important; }';
+    document.head.appendChild(style);
+    
+    // Disable scroll reveal libraries and force all elements to be visible
+    setTimeout(() => {
+      // Disable common scroll reveal libraries
+      if (window.AOS) window.AOS.init({disable: true});
+      if (window.ScrollReveal) window.ScrollReveal().reveal = () => {};
+      if (window.WOW) window.WOW.prototype.show = () => {};
+      
+      // Force all potentially animated elements to be visible
+      document.querySelectorAll('[data-aos], [data-scroll], [data-animation], [data-scroll-reveal], .reveal, .animated, .animate__animated, [class*="reveal-"], [class*="scroll-"], [class*="fade-"]').forEach(el => {
+        el.style.opacity = '1';
+        el.style.transform = 'none';
+        el.style.visibility = 'visible';
+        el.classList.add('aos-animate', 'is-visible', 'in-view', 'active');
+      });
+      
+      // Disable IntersectionObserver which many scroll libraries use
+      const originalIntersectionObserver = window.IntersectionObserver;
+      window.IntersectionObserver = function() {
+        return {
+          observe: () => {},
+          unobserve: () => {},
+          disconnect: () => {}
+        };
+      };
+    }, 500);
+  `,
+        },
+      ],
     };
 
     const response = await fetch(browserlessUrl, {
