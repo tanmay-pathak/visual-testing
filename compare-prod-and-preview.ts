@@ -1,17 +1,44 @@
 import pLimit from "p-limit";
 import * as cheerio from "cheerio";
 import process from "node:process";
+import os from "node:os";
+import path from "node:path";
+import { promises as fsPromises } from "node:fs";
 import {
   compareScreenshots,
   createDiffImage,
-  ensureDirectoriesExist,
-  saveComparisonScreenshots,
+  ensureDirectoriesExistAsync,
+  saveComparisonScreenshotsAsync,
   takeScreenshot,
   transformUrl,
   urlToFilename,
 } from "./visual-testing-utils.ts";
 
-const CONCURRENCY_LIMIT = 5;
+// Calculate optimal concurrency based on CPU cores
+const cpuCount = os.cpus().length;
+const SCREENSHOT_CONCURRENCY = Math.max(10, cpuCount * 2); // I/O-bound, can be higher
+const COMPARISON_CONCURRENCY = Math.max(2, Math.floor(cpuCount * 0.75)); // CPU-bound
+const FILE_IO_CONCURRENCY = 20; // Fast I/O operations
+
+// Create separate limiters
+const screenshotLimiter = pLimit(SCREENSHOT_CONCURRENCY);
+const comparisonLimiter = pLimit(COMPARISON_CONCURRENCY);
+const fileIoLimiter = pLimit(FILE_IO_CONCURRENCY);
+
+const CACHE_DIR = ".cache";
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// URL filters to exclude unnecessary URLs
+const URL_FILTERS = {
+  excludePatterns: [
+    /\/api\//, // API endpoints
+    /\.xml$/, // Sitemaps
+    /\.rss$/, // RSS feeds
+    /\.json$/, // JSON endpoints
+    /\/wp-json\//, // WordPress API
+    /\/admin\//, // Admin panels
+  ],
+};
 
 /**
  * Fetches URLs from a sitemap.
@@ -66,44 +93,135 @@ async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
 }
 
 /**
+ * Checks if a URL should be tested based on filter patterns.
+ * @param url - The URL to check.
+ * @returns True if the URL should be tested, false otherwise.
+ */
+function shouldTestUrl(url: string): boolean {
+  return !URL_FILTERS.excludePatterns.some((pattern) => pattern.test(url));
+}
+
+/**
+ * Gets a cached production screenshot if available and not expired.
+ * @param filename - The filename for the screenshot.
+ * @returns The cached screenshot buffer or null if not available/expired.
+ */
+async function getCachedProdScreenshot(
+  filename: string,
+): Promise<Buffer | null> {
+  const cachePath = path.join(CACHE_DIR, `${filename}_prod.png`);
+
+  try {
+    const stats = await fsPromises.stat(cachePath);
+    const age = Date.now() - stats.mtimeMs;
+
+    if (age < CACHE_TTL) {
+      console.log(`✓ Using cached prod screenshot for ${filename}`);
+      return await fsPromises.readFile(cachePath);
+    }
+  } catch {
+    // Cache miss
+  }
+
+  return null;
+}
+
+/**
+ * Caches a production screenshot.
+ * @param filename - The filename for the screenshot.
+ * @param buffer - The screenshot buffer to cache.
+ */
+async function cacheProdScreenshot(
+  filename: string,
+  buffer: Buffer,
+): Promise<void> {
+  await fsPromises.mkdir(CACHE_DIR, { recursive: true });
+  const cachePath = path.join(CACHE_DIR, `${filename}_prod.png`);
+  await fsPromises.writeFile(cachePath, buffer);
+}
+
+/**
+ * Cleans up old cache files.
+ * @param maxAgeMs - Maximum age in milliseconds for cache files to keep.
+ */
+async function cleanOldCache(
+  maxAgeMs: number = 7 * 24 * 60 * 60 * 1000,
+): Promise<void> {
+  try {
+    const files = await fsPromises.readdir(CACHE_DIR);
+    const now = Date.now();
+
+    for (const file of files) {
+      const filePath = path.join(CACHE_DIR, file);
+      const stats = await fsPromises.stat(filePath);
+      const age = now - stats.mtimeMs;
+
+      if (age > maxAgeMs) {
+        await fsPromises.unlink(filePath);
+        console.log(`Deleted old cache file: ${file}`);
+      }
+    }
+  } catch {
+    // Cache directory doesn't exist yet
+  }
+}
+
+/**
  * Runs a visual test comparing production and preview environments for a given URL.
  * @param prodUrl - The production URL to test.
  * @param previewDomain - The preview domain to compare against.
+ * @returns True if visual changes were detected, false otherwise.
  */
 async function runVisualTest(
   prodUrl: string,
   previewDomain: string,
-) {
+): Promise<boolean> {
   try {
     const filename = urlToFilename(prodUrl);
     const previewUrl = transformUrl(prodUrl, previewDomain);
 
-    const [prodScreenshot, previewScreenshot] = await Promise.all([
-      takeScreenshot(prodUrl),
-      takeScreenshot(previewUrl),
-    ]);
+    // Check cache for prod screenshot only (preview is always fresh)
+    let prodScreenshot = await getCachedProdScreenshot(filename);
 
-    saveComparisonScreenshots(
-      filename,
-      prodScreenshot,
-      previewScreenshot,
+    if (!prodScreenshot) {
+      prodScreenshot = await takeScreenshot(prodUrl);
+      await cacheProdScreenshot(filename, prodScreenshot);
+    }
+
+    // Always take fresh preview screenshot
+    const previewScreenshot = await takeScreenshot(previewUrl);
+
+    // Save screenshots with file I/O limiter (using async version)
+    await fileIoLimiter(() =>
+      saveComparisonScreenshotsAsync(
+        filename,
+        prodScreenshot,
+        previewScreenshot,
+      )
     );
 
-    // Compare screenshots
-    const diffPixels = await compareScreenshots(
-      prodScreenshot,
-      previewScreenshot,
+    // Compare screenshots with comparison limiter
+    const diffPixels = await comparisonLimiter(() =>
+      compareScreenshots(
+        prodScreenshot,
+        previewScreenshot,
+      )
     );
 
     // Create diff image only if differences are detected
     if (diffPixels > 0) {
       await createDiffImage(prodScreenshot, previewScreenshot, filename);
       console.log(
-        `Visual changes detected between prod and preview for ${prodUrl}: ${diffPixels} pixels different`,
+        `✗ Changes: ${prodUrl} (${diffPixels} pixels)`,
       );
+      return true;
+    } else {
+      console.log(`✓ No changes: ${prodUrl}`);
+      return false;
     }
   } catch (error) {
     console.error(`Error running visual test for ${prodUrl}:`, error);
+    return false;
   }
 }
 
@@ -119,17 +237,58 @@ async function main() {
     process.exit(1);
   }
 
-  ensureDirectoriesExist();
-  const limit = pLimit(CONCURRENCY_LIMIT);
+  await ensureDirectoriesExistAsync();
+
+  // Clean old cache files (older than 7 days)
+  await cleanOldCache();
+
+  console.log(`Screenshot concurrency: ${SCREENSHOT_CONCURRENCY}`);
+  console.log(`Comparison concurrency: ${COMPARISON_CONCURRENCY}`);
+  console.log(`File I/O concurrency: ${FILE_IO_CONCURRENCY}`);
 
   try {
     const urlsFromSitemap = await fetchSitemapUrls(sitemapUrl);
     const uniqueUrls = [...new Set(urlsFromSitemap)];
+    const filteredUrls = uniqueUrls.filter((url) => shouldTestUrl(url));
 
-    const tasks = uniqueUrls.map((url) =>
-      limit(() => runVisualTest(url, previewDomain))
+    console.log(
+      `Processing ${filteredUrls.length} URLs (filtered from ${uniqueUrls.length})`,
     );
+
+    let processed = 0;
+    let withChanges = 0;
+    const startTime = Date.now();
+
+    const tasks = filteredUrls.map((url) =>
+      screenshotLimiter(async () => {
+        const hadChanges = await runVisualTest(url, previewDomain);
+        if (hadChanges) withChanges++;
+        processed++;
+
+        // Log progress every 10 URLs or on completion
+        const shouldLog = processed % 10 === 0 || processed === filteredUrls.length;
+
+        if (shouldLog) {
+          const elapsed = (Date.now() - startTime) / 1000;
+          const rate = processed / elapsed;
+          const remaining = filteredUrls.length > processed
+            ? (filteredUrls.length - processed) / rate
+            : 0;
+          console.log(
+            `Progress: ${processed}/${filteredUrls.length} (${rate.toFixed(2)} URLs/sec${remaining > 0 ? `, ~${Math.floor(remaining)}s remaining` : ''})`,
+          );
+        }
+      })
+    );
+
     await Promise.all(tasks);
+
+    const totalTime = (Date.now() - startTime) / 1000;
+    console.log(`\n=== Summary ===`);
+    console.log(`Processed: ${processed} URLs`);
+    console.log(`With changes: ${withChanges}`);
+    console.log(`Time: ${totalTime.toFixed(2)}s`);
+    console.log(`Rate: ${(processed / totalTime).toFixed(2)} URLs/sec`);
   } catch (error) {
     console.error(`Error running visual tests:`, error);
   }
