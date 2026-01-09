@@ -5,13 +5,17 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fsPromises } from "node:fs";
 import {
+  classifyError,
   compareScreenshots,
   createDiffImage,
   ensureDirectoriesExistAsync,
+  type FailedUrl,
+  logVisualTestError,
   saveComparisonScreenshotsAsync,
   takeScreenshot,
   transformUrl,
   urlToFilename,
+  writeErrorSummary,
 } from "./visual-testing-utils.ts";
 
 // Calculate optimal concurrency based on CPU cores
@@ -170,11 +174,15 @@ async function cleanOldCache(
  * Runs a visual test comparing production and preview environments for a given URL.
  * @param prodUrl - The production URL to test.
  * @param previewDomain - The preview domain to compare against.
+ * @param getErrorNumber - Callback function to get the next error number.
+ * @param failedUrls - Array to track failed URLs.
  * @returns True if visual changes were detected, false otherwise.
  */
 async function runVisualTest(
   prodUrl: string,
   previewDomain: string,
+  getErrorNumber: () => number,
+  failedUrls: FailedUrl[],
 ): Promise<boolean> {
   try {
     const filename = urlToFilename(prodUrl);
@@ -200,11 +208,12 @@ async function runVisualTest(
       )
     );
 
-    // Compare screenshots with comparison limiter
+    // Compare screenshots with comparison limiter (auto-resize if dimensions differ)
     const diffPixels = await comparisonLimiter(() =>
       compareScreenshots(
         prodScreenshot,
         previewScreenshot,
+        true, // handleDifferentSizes: auto-resize to match dimensions
       )
     );
 
@@ -220,7 +229,19 @@ async function runVisualTest(
       return false;
     }
   } catch (error) {
-    console.error(`Error running visual test for ${prodUrl}:`, error);
+    // Log error to dedicated error log file (no console output)
+    const errorNumber = getErrorNumber();
+    logVisualTestError(prodUrl, error, errorNumber);
+
+    // Track failed URL
+    const errorType = classifyError(error);
+    failedUrls.push({
+      url: prodUrl,
+      errorType,
+      message: error?.message || String(error),
+      timestamp: new Date().toISOString(),
+    });
+
     return false;
   }
 }
@@ -238,6 +259,17 @@ async function main() {
   }
 
   await ensureDirectoriesExistAsync();
+
+  // Initialize error log file with header
+  await fsPromises.writeFile(
+    "./visual-test-errors.log",
+    `╔══════════════════════════════════════════════════════════════╗
+║           VISUAL TEST ERROR LOG                              ║
+║           Started: ${new Date().toISOString()}                 ║
+╚══════════════════════════════════════════════════════════════╝
+
+`
+  );
 
   // Clean old cache files (older than 7 days)
   await cleanOldCache();
@@ -257,11 +289,22 @@ async function main() {
 
     let processed = 0;
     let withChanges = 0;
+    let errorCount = 0;
+    const failedUrls: FailedUrl[] = [];
     const startTime = Date.now();
 
     const tasks = filteredUrls.map((url) =>
       screenshotLimiter(async () => {
-        const hadChanges = await runVisualTest(url, previewDomain);
+        const hadChanges = await runVisualTest(
+          url,
+          previewDomain,
+          () => {
+            // Error callback: increment error count and return the error number
+            errorCount++;
+            return errorCount;
+          },
+          failedUrls,
+        );
         if (hadChanges) withChanges++;
         processed++;
 
@@ -289,6 +332,17 @@ async function main() {
     console.log(`With changes: ${withChanges}`);
     console.log(`Time: ${totalTime.toFixed(2)}s`);
     console.log(`Rate: ${(processed / totalTime).toFixed(2)} URLs/sec`);
+
+    // Write error summary if there were any failures
+    if (failedUrls.length > 0) {
+      writeErrorSummary({
+        totalUrls: processed,
+        urlsWithChanges: withChanges,
+        urlsFailed: failedUrls.length,
+        failedUrls,
+      });
+      console.log(`\n⚠️  ${failedUrls.length} URL(s) failed. See visual-test-errors.log for details.`);
+    }
   } catch (error) {
     console.error(`Error running visual tests:`, error);
   }
