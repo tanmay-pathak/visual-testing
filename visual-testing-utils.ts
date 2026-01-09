@@ -10,9 +10,31 @@ import process from "node:process";
 export const SCREENSHOTS_DIR = "screenshots";
 export const CHANGES_DIR = "changes";
 export const ERROR_LOG_FILE = "error.log";
+export const VISUAL_TEST_ERROR_LOG = "visual-test-errors.log";
 export const PIXELMATCH_THRESHOLD = 0.1;
 export const DEFAULT_VIEWPORT_WIDTH = 1700;
 export const DEFAULT_VIEWPORT_HEIGHT = 1080;
+
+/**
+ * Error types for visual test failures
+ */
+export enum ErrorType {
+  NETWORK_TIMEOUT = "NETWORK_TIMEOUT",
+  SCREENSHOT_FAILURE = "SCREENSHOT_FAILURE",
+  COMPARISON_ERROR = "COMPARISON_ERROR",
+  FILE_IO_ERROR = "FILE_IO_ERROR",
+  UNKNOWN = "UNKNOWN",
+}
+
+/**
+ * Interface for tracking failed URLs
+ */
+export interface FailedUrl {
+  url: string;
+  errorType: ErrorType;
+  message: string;
+  timestamp: string;
+}
 
 /**
  * Converts a URL to a filename-friendly string.
@@ -288,6 +310,115 @@ export function logError(message: string, error: any): void {
 
   // Append to error log file
   fs.appendFileSync(ERROR_LOG_FILE, errorMessage);
+}
+
+/**
+ * Classifies an error into an ErrorType based on its properties
+ * @param error - The error object to classify
+ * @returns The classified ErrorType
+ */
+// deno-lint-ignore no-explicit-any
+export function classifyError(error: any): ErrorType {
+  if (!error) return ErrorType.UNKNOWN;
+
+  const errorMessage = error.message || error.toString || String(error);
+
+  if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
+    return ErrorType.NETWORK_TIMEOUT;
+  }
+  if (errorMessage.includes("screenshot") || errorMessage.includes("capture")) {
+    return ErrorType.SCREENSHOT_FAILURE;
+  }
+  if (errorMessage.includes("ENOENT") || errorMessage.includes("EACCES")) {
+    return ErrorType.FILE_IO_ERROR;
+  }
+  if (errorMessage.includes("compare") || errorMessage.includes("pixelmatch")) {
+    return ErrorType.COMPARISON_ERROR;
+  }
+
+  return ErrorType.UNKNOWN;
+}
+
+/**
+ * Logs a visual test error to the dedicated error log file (no console output)
+ * @param url - The URL that failed
+ * @param error - The error object
+ * @param errorNumber - The error number for this run
+ */
+// deno-lint-ignore no-explicit-any
+export function logVisualTestError(url: string, error: any, errorNumber: number): void {
+  const timestamp = new Date().toISOString();
+  const errorType = classifyError(error);
+  const errorMessage = error?.message || error?.toString() || String(error);
+  const stackTrace = error?.stack || "No stack trace available";
+
+  const logEntry = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+❌ Error #${errorNumber}: ${errorType.replace(/_/g, " ")}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+URL:         ${url}
+Time:        ${timestamp}
+
+Error Type:  ${errorType}
+Message:     ${errorMessage}
+
+Stack Trace:
+${stackTrace.split("\n").slice(0, 5).join("\n")}
+
+`;
+
+  // Append to visual test error log file (no console output)
+  fs.appendFileSync(VISUAL_TEST_ERROR_LOG, logEntry);
+}
+
+/**
+ * Writes the error summary to the visual test error log
+ * @param summary - The summary object containing error statistics
+ */
+export interface ErrorSummary {
+  totalUrls: number;
+  urlsWithChanges: number;
+  urlsFailed: number;
+  failedUrls: FailedUrl[];
+}
+
+export function writeErrorSummary(summary: ErrorSummary): void {
+  // Count errors by type
+  const errorCounts: Record<ErrorType, number> = {
+    [ErrorType.NETWORK_TIMEOUT]: 0,
+    [ErrorType.SCREENSHOT_FAILURE]: 0,
+    [ErrorType.COMPARISON_ERROR]: 0,
+    [ErrorType.FILE_IO_ERROR]: 0,
+    [ErrorType.UNKNOWN]: 0,
+  };
+
+  summary.failedUrls.forEach((failed) => {
+    errorCounts[failed.errorType]++;
+  });
+
+  const summaryText = `
+╔══════════════════════════════════════════════════════════════╗
+║                    SUMMARY                                   ║
+╚══════════════════════════════════════════════════════════════╝
+
+Total URLs Processed:    ${summary.totalUrls}
+URLs with Changes:       ${summary.urlsWithChanges}
+URLs Failed:             ${summary.urlsFailed}
+
+Error Breakdown:
+${Object.entries(errorCounts)
+  .filter(([_, count]) => count > 0)
+  .map(([type, count]) => `  • ${type.replace(/_/g, " ")}: ${count}`)
+  .join("\n")}
+
+${summary.failedUrls.length > 0 ? `Failed URLs:
+${summary.failedUrls.map((f, i) => `  ${i + 1}. ${f.url} (${f.errorType})`).join("\n")}
+` : ""}
+═════════════════════════════════════════════════════════════════
+`;
+
+  fs.appendFileSync(VISUAL_TEST_ERROR_LOG, summaryText);
 }
 
 /**
