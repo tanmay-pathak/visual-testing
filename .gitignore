@@ -136,3 +136,6 @@ safari/
 screenshots-screen/
 crawled_urls/
 compare/
+
+# Screenshot cache
+.cache/

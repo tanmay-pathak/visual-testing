@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { promises as fsPromises } from "node:fs";
 import path from "node:path";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
@@ -323,6 +324,16 @@ export function ensureDirectoriesExist(): void {
 }
 
 /**
+ * Async version of ensureDirectoriesExist
+ */
+export async function ensureDirectoriesExistAsync(): Promise<void> {
+  await Promise.all([
+    fsPromises.mkdir(SCREENSHOTS_DIR, { recursive: true }),
+    fsPromises.mkdir(CHANGES_DIR, { recursive: true }),
+  ]);
+}
+
+/**
  * Saves screenshots for URL comparison
  * @param filename - Base filename to use for the screenshots
  * @param screenshot1 - Buffer of the first screenshot
@@ -339,6 +350,29 @@ export function saveComparisonScreenshots(
 
   fs.writeFileSync(screenshot1Path, screenshot1);
   fs.writeFileSync(screenshot2Path, screenshot2);
+
+  return { screenshot1Path, screenshot2Path };
+}
+
+/**
+ * Async version of saveComparisonScreenshots
+ * @param filename - Base filename to use for the screenshots
+ * @param screenshot1 - Buffer of the first screenshot
+ * @param screenshot2 - Buffer of the second screenshot
+ * @returns Object containing paths to the saved screenshots
+ */
+export async function saveComparisonScreenshotsAsync(
+  filename: string,
+  screenshot1: Buffer,
+  screenshot2: Buffer,
+): Promise<{ screenshot1Path: string; screenshot2Path: string }> {
+  const screenshot1Path = path.join(SCREENSHOTS_DIR, `${filename}_prod.png`);
+  const screenshot2Path = path.join(SCREENSHOTS_DIR, `${filename}_preview.png`);
+
+  await Promise.all([
+    fsPromises.writeFile(screenshot1Path, screenshot1),
+    fsPromises.writeFile(screenshot2Path, screenshot2),
+  ]);
 
   return { screenshot1Path, screenshot2Path };
 }
