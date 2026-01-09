@@ -17,7 +17,7 @@ const BASE_DIR = path.join(os.homedir(), "visual-testing-compare");
 const SCREENSHOTS_DIR = path.join(BASE_DIR, "base");
 const CHANGES_DIR = path.join(BASE_DIR, "changes");
 
-type VisualTestResult = boolean | null; // true=changes, false=no changes, null=failed
+type VisualTestResult = boolean | null; // true=changes detected, false=no changes, null=comparison failed
 
 async function runVisualTest(
   url: string,
@@ -30,9 +30,8 @@ async function runVisualTest(
     const newScreenshot = await takeScreenshot(url);
 
     if (!isBaseline) {
-      // Check if baseline screenshot exists
+      // Try to read the baseline screenshot directly (no access check to avoid race condition)
       try {
-        await fsPromises.access(screenshotPath);
         const oldScreenshot = await fsPromises.readFile(screenshotPath);
         const diffPixels = await compareScreenshots(
           oldScreenshot,
@@ -57,22 +56,24 @@ async function runVisualTest(
           return false;
         }
       } catch (err) {
-        // Only continue if baseline doesn't exist; re-throw other errors
+        // Handle baseline read errors
         if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
-          console.log(
-            `⚠️  Baseline screenshot not found for ${url}, creating new baseline`,
+          // Baseline missing - fail explicitly to prevent creating wrong baseline from changes branch
+          throw new Error(
+            `Baseline screenshot not found for ${url}. Run with baseline creation mode first.`,
+            { cause: err },
           );
-        } else {
-          // Re-throw any non-ENOENT error with context
-          throw new Error(`Failed to access baseline screenshot: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
         }
+        // Re-throw any other read error with context
+        throw new Error(
+          `Failed to read baseline screenshot: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
       }
-    } else {
-      console.log(
-        `Taking baseline screenshot for ${url}`,
-      );
     }
 
+    // Create baseline screenshot
+    console.log(`Taking baseline screenshot for ${url}`);
     await fsPromises.writeFile(screenshotPath, newScreenshot);
     return false;
   } catch (error) {
@@ -88,7 +89,9 @@ async function runVisualTest(
       timestamp: new Date().toISOString(),
     });
 
-    // Re-throw if baseline capture failed to prevent stale comparisons
+    // CRITICAL: If baseline capture failed, we must exit the entire script.
+    // Without a valid baseline, any comparison would be meaningless or misleading.
+    // This is intentional behavior - don't proceed with comparisons when baseline is unavailable.
     if (isBaseline) {
       throw error;
     }
