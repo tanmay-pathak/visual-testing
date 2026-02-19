@@ -1,0 +1,34 @@
+README.md
+  07a60c5ca02ebc7e 38,45-69
+task-launcher-core.ts
+  07a60c5ca02ebc7e 1-233
+task-launcher.ts
+  07a60c5ca02ebc7e 1-417
+task-manifest.ts
+  07a60c5ca02ebc7e 1-357
+deno.json
+  07a60c5ca02ebc7e 3
+task-launcher-core_test.ts
+  07a60c5ca02ebc7e 1-215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.4",
+  "base_commit_sha": "4ca504fd2aa96ed4f1b28cbf3c018d7f6886ea9d",
+  "prompts": {
+    "07a60c5ca02ebc7e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019c770b-1fdd-7201-bca0-0482208a3309",
+        "model": "gpt-5.3-codex"
+      },
+      "human_author": "Tanmay Pathak <71184799+tanmay-pathak@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 1249,
+      "total_deletions": 0,
+      "accepted_lines": 1249,
+      "overriden_lines": 0,
+      "messages_url": "https://usegitai.com/cas/512821445238578cd65e9642e3b58b7e45e93efb8deabba9e6e363b9e1264ebe"
+    }
+  }
+}
