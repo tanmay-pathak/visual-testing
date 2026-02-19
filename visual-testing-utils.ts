@@ -15,6 +15,12 @@ export const PIXELMATCH_THRESHOLD = 0.1;
 export const DEFAULT_VIEWPORT_WIDTH = 1700;
 export const DEFAULT_VIEWPORT_HEIGHT = 1080;
 
+const DEFAULT_SCREENSHOT_TIMEOUT_MS = 45_000;
+const DEFAULT_RETRIES = 2;
+const DEFAULT_RETRY_DELAY_MS = 1_000;
+const DEFAULT_MAX_RETRY_DELAY_MS = 10_000;
+const DEFAULT_RETRY_BACKOFF_MULTIPLIER = 2;
+
 /**
  * Error types for visual test failures
  */
@@ -36,6 +42,109 @@ export interface FailedUrl {
   timestamp: string;
 }
 
+export interface RetryOptions {
+  retries?: number;
+  retryDelayMs?: number;
+  maxRetryDelayMs?: number;
+  backoffMultiplier?: number;
+  jitter?: boolean;
+}
+
+export interface ScreenshotOptions extends RetryOptions {
+  timeoutMs?: number;
+}
+
+/**
+ * Converts unknown errors to a stable string representation.
+ */
+export function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+/**
+ * Extracts a safe stack representation from unknown errors.
+ */
+export function getErrorStack(error: unknown): string {
+  if (error instanceof Error && error.stack) {
+    return error.stack;
+  }
+
+  return "No stack trace available";
+}
+
+/**
+ * Simple delay helper.
+ */
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Retries an async operation with exponential backoff.
+ */
+export async function withRetry<T>(
+  operation: () => Promise<T>,
+  options: RetryOptions = {},
+  operationName: string = "operation",
+): Promise<T> {
+  const retries = Math.max(0, options.retries ?? DEFAULT_RETRIES);
+  const retryDelayMs = Math.max(
+    1,
+    options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
+  );
+  const maxRetryDelayMs = Math.max(
+    retryDelayMs,
+    options.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS,
+  );
+  const backoffMultiplier = Math.max(
+    1,
+    options.backoffMultiplier ?? DEFAULT_RETRY_BACKOFF_MULTIPLIER,
+  );
+  const jitter = options.jitter ?? true;
+
+  let attempt = 0;
+
+  while (true) {
+    try {
+      return await operation();
+    } catch (error) {
+      attempt++;
+
+      if (attempt > retries) {
+        throw error;
+      }
+
+      const baseDelay = Math.min(
+        maxRetryDelayMs,
+        Math.round(retryDelayMs * Math.pow(backoffMultiplier, attempt - 1)),
+      );
+      const delayMs = jitter
+        ? Math.max(1, Math.round(baseDelay * (0.8 + Math.random() * 0.4)))
+        : baseDelay;
+
+      console.warn(
+        `Retrying ${operationName} (${attempt}/${retries}) in ${delayMs}ms after error: ${
+          getErrorMessage(error)
+        }`,
+      );
+
+      await sleep(delayMs);
+    }
+  }
+}
+
 /**
  * Converts a URL to a filename-friendly string.
  * @param url - The URL to convert.
@@ -45,15 +154,55 @@ export function urlToFilename(url: string): string {
   return url.replace(/[^a-z0-9]/gi, "_").toLowerCase();
 }
 
+function sanitizePathSegment(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function getRunTimestamp(date: Date = new Date()): string {
+  return date
+    .toISOString()
+    .replace(/[:]/g, "-")
+    .replace(/\.\d+z$/i, "z");
+}
+
+/**
+ * Creates a run-specific output directory path under the provided base directory.
+ */
+export async function createRunSubdirectory(
+  baseDir: string,
+  defaultPrefix: string,
+  runName?: string,
+): Promise<string> {
+  await fsPromises.mkdir(baseDir, { recursive: true });
+
+  const prefix = sanitizePathSegment(defaultPrefix) || "run";
+  const customName = runName ? sanitizePathSegment(runName) : "";
+  const namePart = customName ? `${prefix}-${customName}` : prefix;
+  const runDir = path.join(baseDir, `${namePart}-${getRunTimestamp()}`);
+
+  await fsPromises.mkdir(runDir, { recursive: true });
+  return runDir;
+}
+
 /**
  * Takes a screenshot of the given URL using browserless service.
  * @param url - The URL to capture.
- * @param width - The viewport width for the screenshot.
+ * @param options - Screenshot and retry options.
  * @returns A buffer containing the screenshot.
  */
 export async function takeScreenshot(
   url: string,
+  options: ScreenshotOptions = {},
 ): Promise<Buffer> {
+  const timeoutMs = Math.max(
+    1_000,
+    options.timeoutMs ?? DEFAULT_SCREENSHOT_TIMEOUT_MS,
+  );
+
   try {
     const launchArgs = JSON.stringify({
       args: [
@@ -64,59 +213,61 @@ export async function takeScreenshot(
       ],
     });
 
-    const BASE_URL = process.env.BASE_URL!;
-    const API_TOKEN = process.env.API_TOKEN!;
+    const baseUrl = process.env.BASE_URL;
+    const apiToken = process.env.API_TOKEN;
 
-    if (!API_TOKEN || !BASE_URL) {
+    if (!apiToken || !baseUrl) {
       throw new Error(
-        "API_TOKEN environment variable is required but not set or BASE_URL.",
+        "BASE_URL and API_TOKEN environment variables are required but not set.",
       );
     }
 
     const browserlessUrl =
-      `${BASE_URL}/screenshot?token=${API_TOKEN}&launch=${launchArgs}`;
-    const headers = {
-      "Cache-Control": "no-cache",
-      "Content-Type": "application/json",
-    };
+      `${baseUrl}/screenshot?token=${apiToken}&launch=${launchArgs}`;
 
-    const data = {
-      url: url,
-      options: {
-        fullPage: true,
-        type: "png",
-      },
-      viewport: {
-        width: 1700,
-        height: 2000,
-      },
-      scrollPage: true,
-      addScriptTag: [
-        {
-          content: `
-    // Force reduced motion styles and disable animations
+    return await withRetry(
+      async () => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+        try {
+          const response = await fetch(browserlessUrl, {
+            method: "POST",
+            headers: {
+              "Cache-Control": "no-cache",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              url,
+              options: {
+                fullPage: true,
+                type: "png",
+              },
+              viewport: {
+                width: DEFAULT_VIEWPORT_WIDTH,
+                height: 2000,
+              },
+              scrollPage: true,
+              addScriptTag: [
+                {
+                  content: `
     const style = document.createElement('style');
     style.innerHTML = '* { animation: none !important; transition: none !important; }';
     style.innerHTML += '[data-aos], [data-scroll], [data-animation], [data-scroll-reveal], .reveal, .animated, .animate__animated { opacity: 1 !important; transform: none !important; visibility: visible !important; }';
     document.head.appendChild(style);
-    
-    // Disable scroll reveal libraries and force all elements to be visible
+
     setTimeout(() => {
-      // Disable common scroll reveal libraries
-      if (window.AOS) window.AOS.init({disable: true});
+      if (window.AOS) window.AOS.init({ disable: true });
       if (window.ScrollReveal) window.ScrollReveal().reveal = () => {};
       if (window.WOW) window.WOW.prototype.show = () => {};
-      
-      // Force all potentially animated elements to be visible
+
       document.querySelectorAll('[data-aos], [data-scroll], [data-animation], [data-scroll-reveal], .reveal, .animated, .animate__animated, [class*="reveal-"], [class*="scroll-"], [class*="fade-"]').forEach(el => {
         el.style.opacity = '1';
         el.style.transform = 'none';
         el.style.visibility = 'visible';
         el.classList.add('aos-animate', 'is-visible', 'in-view', 'active');
       });
-      
-      // Disable IntersectionObserver which many scroll libraries use
-      const originalIntersectionObserver = window.IntersectionObserver;
+
       window.IntersectionObserver = function() {
         return {
           observe: () => {},
@@ -126,27 +277,30 @@ export async function takeScreenshot(
       };
     }, 500);
   `,
-        },
-      ],
-    };
+                },
+              ],
+            }),
+            signal: controller.signal,
+          });
 
-    const response = await fetch(browserlessUrl, {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(data),
-    });
+          if (!response.ok) {
+            throw new Error(
+              `Failed to take screenshot: ${response.status} ${response.statusText}`,
+            );
+          }
 
-    if (!response.ok) {
-      throw new Error(
-        `Failed to take screenshot: ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const imageBuffer = await response.arrayBuffer();
-    return Buffer.from(imageBuffer);
+          const imageBuffer = await response.arrayBuffer();
+          return Buffer.from(imageBuffer);
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
+      options,
+      `takeScreenshot(${url})`,
+    );
   } catch (error) {
     logError(`Error taking screenshot for URL ${url}`, error);
-    throw error; // Re-throw to allow caller to handle
+    throw error;
   }
 }
 
@@ -154,7 +308,7 @@ export async function takeScreenshot(
  * Compares two screenshots and returns the number of differing pixels.
  * @param oldImage - The buffer of the old screenshot.
  * @param newImage - The buffer of the new screenshot.
- * @param handleDifferentSizes - Whether to handle different image sizes
+ * @param handleDifferentSizes - Whether to handle different image sizes.
  * @returns The number of differing pixels.
  */
 export async function compareScreenshots(
@@ -163,26 +317,21 @@ export async function compareScreenshots(
   handleDifferentSizes: boolean = false,
 ): Promise<number> {
   if (handleDifferentSizes) {
-    // Use Jimp to resize images if they don't match
     const oldJimp = await Jimp.read(oldImage);
     const newJimp = await Jimp.read(newImage);
 
-    // Get dimensions
     const oldWidth = oldJimp.getWidth();
     const oldHeight = oldJimp.getHeight();
     const newWidth = newJimp.getWidth();
     const newHeight = newJimp.getHeight();
 
-    // If dimensions don't match, resize to the larger of each dimension
     if (oldWidth !== newWidth || oldHeight !== newHeight) {
       const maxWidth = Math.max(oldWidth, newWidth);
       const maxHeight = Math.max(oldHeight, newHeight);
 
-      // Resize both images to match the larger dimensions
       oldJimp.resize(maxWidth, maxHeight);
       newJimp.resize(maxWidth, maxHeight);
 
-      // Convert back to PNG for comparison
       const oldResized = PNG.sync.read(
         await oldJimp.getBufferAsync(Jimp.MIME_PNG),
       );
@@ -190,7 +339,6 @@ export async function compareScreenshots(
         await newJimp.getBufferAsync(Jimp.MIME_PNG),
       );
 
-      // Create diff using resized images
       const diff = new PNG({ width: maxWidth, height: maxHeight });
 
       return pixelmatch(
@@ -204,7 +352,6 @@ export async function compareScreenshots(
     }
   }
 
-  // Images already match in size, use original comparison
   const img1 = PNG.sync.read(oldImage);
   const img2 = PNG.sync.read(newImage);
   const { width, height } = img1;
@@ -228,26 +375,21 @@ export async function createDiffImageWithPath(
   filename: string,
   outputDir: string,
 ): Promise<void> {
-  // Create the output directory if it doesn't exist
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  // Load images with Jimp
   const oldJimp = await Jimp.read(oldImage);
   const newJimp = await Jimp.read(newImage);
 
-  // Get dimensions
   const oldWidth = oldJimp.getWidth();
   const oldHeight = oldJimp.getHeight();
   const newWidth = newJimp.getWidth();
   const newHeight = newJimp.getHeight();
 
-  // Determine max dimensions for the composite image
   const maxWidth = Math.max(oldWidth, newWidth);
   const maxHeight = Math.max(oldHeight, newHeight);
 
-  // Resize if necessary
   if (oldWidth !== maxWidth || oldHeight !== maxHeight) {
     oldJimp.resize(maxWidth, maxHeight);
   }
@@ -256,7 +398,6 @@ export async function createDiffImageWithPath(
     newJimp.resize(maxWidth, maxHeight);
   }
 
-  // Convert back to PNG for pixelmatch
   const oldBuffer = await oldJimp.getBufferAsync(Jimp.MIME_PNG);
   const newBuffer = await newJimp.getBufferAsync(Jimp.MIME_PNG);
 
@@ -269,8 +410,6 @@ export async function createDiffImageWithPath(
   });
 
   const diffJimp = await Jimp.read(PNG.sync.write(diff));
-
-  // Create composite image with all three images side by side
   const composite = new Jimp(maxWidth * 3, maxHeight);
 
   composite.composite(oldJimp, 0, 0);
@@ -291,48 +430,42 @@ export async function createDiffImage(
   oldImage: Buffer,
   newImage: Buffer,
   filename: string,
+  outputDir: string = CHANGES_DIR,
 ): Promise<void> {
-  // Use the createDiffImageWithPath function with the default CHANGES_DIR
-  await createDiffImageWithPath(oldImage, newImage, filename, CHANGES_DIR);
+  await createDiffImageWithPath(oldImage, newImage, filename, outputDir);
 }
 
 /**
- * Logs error to both console and error log file
- * @param message - Error message to log
- * @param error - Error object
+ * Logs error to both console and error log file.
  */
-// deno-lint-ignore no-explicit-any
-export function logError(message: string, error: any): void {
+export function logError(message: string, error: unknown): void {
   const timestamp = new Date().toISOString();
-  const errorMessage = `[${timestamp}] ${message}: ${error}\n`;
+  const errorMessage = `[${timestamp}] ${message}: ${getErrorMessage(error)}\n`;
 
   console.error(errorMessage);
-
-  // Append to error log file
   fs.appendFileSync(ERROR_LOG_FILE, errorMessage);
 }
 
 /**
- * Classifies an error into an ErrorType based on its properties
- * @param error - The error object to classify
- * @returns The classified ErrorType
+ * Classifies an error into an ErrorType based on its properties.
  */
-// deno-lint-ignore no-explicit-any
-export function classifyError(error: any): ErrorType {
-  if (!error) return ErrorType.UNKNOWN;
+export function classifyError(error: unknown): ErrorType {
+  const message = getErrorMessage(error).toLowerCase();
 
-  const errorMessage = error.message || error.toString || String(error);
-
-  if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT")) {
+  if (
+    message.includes("timeout") ||
+    message.includes("etimedout") ||
+    message.includes("abort")
+  ) {
     return ErrorType.NETWORK_TIMEOUT;
   }
-  if (errorMessage.includes("screenshot") || errorMessage.includes("capture")) {
+  if (message.includes("screenshot") || message.includes("capture")) {
     return ErrorType.SCREENSHOT_FAILURE;
   }
-  if (errorMessage.includes("ENOENT") || errorMessage.includes("EACCES")) {
+  if (message.includes("enoent") || message.includes("eacces")) {
     return ErrorType.FILE_IO_ERROR;
   }
-  if (errorMessage.includes("compare") || errorMessage.includes("pixelmatch")) {
+  if (message.includes("compare") || message.includes("pixelmatch")) {
     return ErrorType.COMPARISON_ERROR;
   }
 
@@ -340,17 +473,17 @@ export function classifyError(error: any): ErrorType {
 }
 
 /**
- * Logs a visual test error to the dedicated error log file (no console output)
- * @param url - The URL that failed
- * @param error - The error object
- * @param errorNumber - The error number for this run
+ * Logs a visual test error to the dedicated error log file (no console output).
  */
-// deno-lint-ignore no-explicit-any
-export function logVisualTestError(url: string, error: any, errorNumber: number): void {
+export function logVisualTestError(
+  url: string,
+  error: unknown,
+  errorNumber: number,
+): void {
   const timestamp = new Date().toISOString();
   const errorType = classifyError(error);
-  const errorMessage = error?.message || error?.toString() || String(error);
-  const stackTrace = error?.stack || "No stack trace available";
+  const errorMessage = getErrorMessage(error);
+  const stackTrace = getErrorStack(error);
 
   const logEntry = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -368,13 +501,11 @@ ${stackTrace.split("\n").slice(0, 5).join("\n")}
 
 `;
 
-  // Append to visual test error log file (no console output)
   fs.appendFileSync(VISUAL_TEST_ERROR_LOG, logEntry);
 }
 
 /**
- * Writes the error summary to the visual test error log
- * @param summary - The summary object containing error statistics
+ * Writes the error summary to the visual test error log.
  */
 export interface ErrorSummary {
   totalUrls: number;
@@ -384,7 +515,6 @@ export interface ErrorSummary {
 }
 
 export function writeErrorSummary(summary: ErrorSummary): void {
-  // Count errors by type
   const errorCounts: Record<ErrorType, number> = {
     [ErrorType.NETWORK_TIMEOUT]: 0,
     [ErrorType.SCREENSHOT_FAILURE]: 0,
@@ -407,14 +537,24 @@ URLs with Changes:       ${summary.urlsWithChanges}
 URLs Failed:             ${summary.urlsFailed}
 
 Error Breakdown:
-${Object.entries(errorCounts)
-  .filter(([_, count]) => count > 0)
-  .map(([type, count]) => `  • ${type.replace(/_/g, " ")}: ${count}`)
-  .join("\n")}
+${
+    Object.entries(errorCounts)
+      .filter(([_, count]) => count > 0)
+      .map(([type, count]) => `  • ${type.replace(/_/g, " ")}: ${count}`)
+      .join("\n")
+  }
 
-${summary.failedUrls.length > 0 ? `Failed URLs:
-${summary.failedUrls.map((f, i) => `  ${i + 1}. ${f.url} (${f.errorType})`).join("\n")}
-` : ""}
+${
+    summary.failedUrls.length > 0
+      ? `Failed URLs:
+${
+        summary.failedUrls.map((f, i) =>
+          `  ${i + 1}. ${f.url} (${f.errorType})`
+        ).join("\n")
+      }
+`
+      : ""
+  }
 ═════════════════════════════════════════════════════════════════
 `;
 
@@ -423,18 +563,16 @@ ${summary.failedUrls.map((f, i) => `  ${i + 1}. ${f.url} (${f.errorType})`).join
 
 /**
  * Transforms a URL by replacing its base domain with a new one.
- * @param originalUrl - The original URL to transform.
- * @param newBaseDomain - The new base domain to use.
- * @returns The transformed URL.
  */
 export function transformUrl(
   originalUrl: string,
   newBaseDomain: string | null,
 ): string {
   if (!newBaseDomain) return originalUrl;
+
   try {
     const url = new URL(originalUrl);
-    return originalUrl.replace(url.origin, `${newBaseDomain}`);
+    return originalUrl.replace(url.origin, newBaseDomain);
   } catch (error) {
     logError(`Error transforming URL ${originalUrl}`, error);
     return originalUrl;
@@ -442,7 +580,7 @@ export function transformUrl(
 }
 
 /**
- * Ensures the necessary directories exist
+ * Ensures the necessary directories exist.
  */
 export function ensureDirectoriesExist(): void {
   if (!fs.existsSync(SCREENSHOTS_DIR)) {
@@ -455,7 +593,7 @@ export function ensureDirectoriesExist(): void {
 }
 
 /**
- * Async version of ensureDirectoriesExist
+ * Async version of ensureDirectoriesExist.
  */
 export async function ensureDirectoriesExistAsync(): Promise<void> {
   await Promise.all([
@@ -465,11 +603,7 @@ export async function ensureDirectoriesExistAsync(): Promise<void> {
 }
 
 /**
- * Saves screenshots for URL comparison
- * @param filename - Base filename to use for the screenshots
- * @param screenshot1 - Buffer of the first screenshot
- * @param screenshot2 - Buffer of the second screenshot
- * @returns Object containing paths to the saved screenshots
+ * Saves screenshots for URL comparison.
  */
 export function saveComparisonScreenshots(
   filename: string,
@@ -486,11 +620,7 @@ export function saveComparisonScreenshots(
 }
 
 /**
- * Async version of saveComparisonScreenshots
- * @param filename - Base filename to use for the screenshots
- * @param screenshot1 - Buffer of the first screenshot
- * @param screenshot2 - Buffer of the second screenshot
- * @returns Object containing paths to the saved screenshots
+ * Async version of saveComparisonScreenshots.
  */
 export async function saveComparisonScreenshotsAsync(
   filename: string,
@@ -509,25 +639,22 @@ export async function saveComparisonScreenshotsAsync(
 }
 
 /**
- * Logs the results of visual comparison
- * @param diffPixels - Number of pixels that differ between images
- * @param filename - Base filename used for the comparison
- * @param screenshot1Path - Path to the first screenshot
- * @param screenshot2Path - Path to the second screenshot
+ * Logs the results of visual comparison.
  */
 export function logComparisonResults(
   diffPixels: number,
   filename: string,
   screenshot1Path: string,
   screenshot2Path: string,
+  changesOutputDir: string = CHANGES_DIR,
 ): void {
-  const diffPath = path.join(CHANGES_DIR, `${filename}_diff.png`);
+  const diffPath = path.join(changesOutputDir, `${filename}_diff.png`);
 
   if (diffPixels > 0) {
     console.log(`Visual differences detected: ${diffPixels} pixels different`);
     console.log(`Comparison saved to ${diffPath}`);
   } else {
-    console.log(`No visual differences detected`);
+    console.log("No visual differences detected");
     console.log(`Comparison saved to ${diffPath}`);
   }
 
@@ -537,52 +664,49 @@ export function logComparisonResults(
 }
 
 /**
- * Performs a complete visual comparison of two URLs
- * @param url1 - The first URL to test
- * @param url2 - The second URL to test
- * @param viewportWidth - Optional width to use for both screenshots
+ * Performs a complete visual comparison of two URLs.
  */
 export async function performUrlComparison(
   url1: string,
   url2: string,
+  screenshotOptions: ScreenshotOptions = {},
+  changesOutputDir: string = CHANGES_DIR,
 ): Promise<void> {
   ensureDirectoriesExist();
 
   try {
-    console.log(`Comparing URLs`);
+    console.log("Comparing URLs");
     console.log(`1. ${url1}`);
     console.log(`2. ${url2}`);
 
     const filename = urlToFilename(url1);
 
-    const screenshot1 = await takeScreenshot(url1);
-    const screenshot2 = await takeScreenshot(url2);
+    const screenshot1 = await takeScreenshot(url1, screenshotOptions);
+    const screenshot2 = await takeScreenshot(url2, screenshotOptions);
 
-    // Save both screenshots
     const { screenshot1Path, screenshot2Path } = saveComparisonScreenshots(
       filename,
       screenshot1,
       screenshot2,
     );
 
-    // Compare screenshots
     const diffPixels = await compareScreenshots(
       screenshot1,
       screenshot2,
       true,
     );
 
-    // Always create diff image regardless of pixel differences
-    await createDiffImage(screenshot1, screenshot2, filename);
+    await createDiffImage(screenshot1, screenshot2, filename, changesOutputDir);
 
-    // Log the results
     logComparisonResults(
       diffPixels,
       filename,
       screenshot1Path,
       screenshot2Path,
+      changesOutputDir,
     );
   } catch (error) {
-    logError(`Error comparing URLs`, error);
+    logError("Error comparing URLs", error);
+    throw error;
   }
 }
