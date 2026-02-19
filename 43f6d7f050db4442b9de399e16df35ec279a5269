@@ -1,0 +1,40 @@
+deno.json
+  65aea4d3b3fa20f4 3-9
+README.md
+  65aea4d3b3fa20f4 44,123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.4",
+  "base_commit_sha": "43f6d7f050db4442b9de399e16df35ec279a5269",
+  "prompts": {
+    "161be17e6ebe9e42": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019c763c-b7ec-7bb1-8fff-fc847c2018de",
+        "model": "gpt-5.3-codex"
+      },
+      "human_author": "Tanmay Pathak <71184799+tanmay-pathak@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 86,
+      "total_deletions": 28,
+      "accepted_lines": 74,
+      "overriden_lines": 0,
+      "messages_url": "https://usegitai.com/cas/33c5cfe05494b9c82bd4bd3abaa22f5c243547b8a9de510dcfc6a164a6c717d0"
+    },
+    "65aea4d3b3fa20f4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019c768f-3cd9-7071-9e2c-115ba348354f",
+        "model": "gpt-5.3-codex"
+      },
+      "human_author": "Tanmay Pathak <71184799+tanmay-pathak@users.noreply.github.com>",
+      "messages": [],
+      "total_additions": 9,
+      "total_deletions": 2294,
+      "accepted_lines": 9,
+      "overriden_lines": 0,
+      "messages_url": "https://usegitai.com/cas/1768772b40deca832a35e738def714aea4863ab2755501d829f4ee0232199a0d"
+    }
+  }
+}
