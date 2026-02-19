@@ -1,0 +1,11 @@
+{
+  "tasks": {
+    "compare:prod-preview": "deno run --env-file=.env --allow-all compare-prod-and-preview.ts",
+    "compare:url": "deno run --env-file=.env --allow-all compare-single-url.ts",
+    "compare:branches": "deno run --env-file=.env --allow-all compare-branches.ts",
+    "sitemap:screenshots": "deno run --env-file=.env --allow-all take-sitemap-screenshots.ts",
+    "sitemap:open": "deno run --allow-all open-sitemap-urls.ts",
+    "check": "deno fmt --check && deno lint *.ts && deno check *.ts",
+    "test": "deno test"
+  }
+}

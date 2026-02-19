@@ -4,49 +4,103 @@
 
 1. Install Deno:
 
-```shell
+```sh
 brew install deno
 ```
 
-2. Install packages
+2. Start browserless:
 
-```shell
-deno install
+```sh
+docker compose up -d
 ```
 
-3. Configure browserless:
+3. Configure environment variables:
 
-This tool requires browserless for visual comparison. Run `docker compose up` to
-spin up an instance of browserless. Create a `.env` file based on the
-`.env.example`:
-
-```shell
+```sh
 cp .env.example .env
 ```
 
-Then update the values in your `.env` file:
+Set these values in `.env`:
 
-- `BASE_URL`: Your browserless instance URL. Default is already added in the
-  docker-compose.
-- `API_TOKEN`: Your browserless API token. Default is already added in the
-  docker-compose.
+- `BASE_URL`: browserless URL (default local: `http://localhost:3000`)
+- `API_TOKEN`: browserless API token
 
-## Usage Examples
+## Commands
 
-Compare production and preview:
+Run all commands with Deno tasks:
 
-```shell
-deno --env-file=.env --allow-all compare-prod-and-preview.ts https://zu.com/sitemap-0.xml https://deploy-preview-385--zuc-web.netlify.app
+```sh
+deno task <task-name> <args>
+```
+
+Available tasks:
+
+- `compare:prod-preview`
+- `compare:url`
+- `compare:branches`
+- `sitemap:screenshots`
+- `sitemap:open`
+- `check`
+
+## Usage
+
+Compare production and preview via sitemap:
+
+```sh
+deno task compare:prod-preview https://zu.com/sitemap-0.xml https://deploy-preview-385--zuc-web.netlify.app
 ```
 
 Compare a single URL:
 
-```shell
-deno --env-file=.env --allow-all compare-single-url.ts https://zu.com/work https://deploy-preview-385--zuc-web.netlify.app/work
+```sh
+deno task compare:url https://zu.com/work https://deploy-preview-385--zuc-web.netlify.app/work
 ```
 
-Compare branches:
+Compare branches for one URL:
 
-```shell
-deno --env-file=.env --allow-all compare-branches.ts http://localhost:4321/work test
+```sh
+deno task compare:branches http://localhost:4321/work test
+```
+
+Take screenshots for sitemap URLs:
+
+```sh
+deno task sitemap:screenshots https://example.com/sitemap.xml
+```
+
+Open sitemap URLs in Safari:
+
+```sh
+deno task sitemap:open https://example.com/sitemap.xml
+```
+
+## Common optional flags
+
+Most scripts support these optional flags:
+
+- `--timeout-ms <ms>`
+- `--retries <n>`
+- `--retry-delay-ms <ms>`
+- `--max-urls <n>`
+- `--help`
+
+Script-specific flags include:
+
+- `compare:prod-preview`: `--concurrency`, `--comparison-concurrency`,
+  `--file-io-concurrency`, `--cache-ttl-ms`, `--cache-cleanup-age-ms`,
+  `--no-cache`
+- `sitemap:screenshots`: `--concurrency`
+- `sitemap:open`: `--concurrency`, `--yes`
+
+## Branch compare precondition
+
+`compare:branches` exits immediately if the git working tree has tracked or
+untracked changes. Run it only from a clean working tree.
+
+## Validation
+
+Run static validation:
+
+```sh
+deno task check
 ```

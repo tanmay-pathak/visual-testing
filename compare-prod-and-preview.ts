@@ -1,117 +1,199 @@
 import pLimit from "p-limit";
-import * as cheerio from "cheerio";
 import process from "node:process";
 import os from "node:os";
 import path from "node:path";
+import { parseArgs } from "node:util";
 import { promises as fsPromises } from "node:fs";
+import { Buffer } from "node:buffer";
+import { fetchSitemapUrls } from "./sitemap-utils.ts";
 import {
   classifyError,
   compareScreenshots,
   createDiffImage,
   ensureDirectoriesExistAsync,
   type FailedUrl,
+  getErrorMessage,
   logVisualTestError,
   saveComparisonScreenshotsAsync,
+  type ScreenshotOptions,
   takeScreenshot,
   transformUrl,
   urlToFilename,
   writeErrorSummary,
 } from "./visual-testing-utils.ts";
 
-// Calculate optimal concurrency based on CPU cores
 const cpuCount = os.cpus().length;
-const SCREENSHOT_CONCURRENCY = Math.max(10, cpuCount * 2); // I/O-bound, can be higher
-const COMPARISON_CONCURRENCY = Math.max(2, Math.floor(cpuCount * 0.75)); // CPU-bound
-const FILE_IO_CONCURRENCY = 20; // Fast I/O operations
-
-// Create separate limiters
-const screenshotLimiter = pLimit(SCREENSHOT_CONCURRENCY);
-const comparisonLimiter = pLimit(COMPARISON_CONCURRENCY);
-const fileIoLimiter = pLimit(FILE_IO_CONCURRENCY);
+const DEFAULT_SCREENSHOT_CONCURRENCY = Math.max(10, cpuCount * 2);
+const DEFAULT_COMPARISON_CONCURRENCY = Math.max(2, Math.floor(cpuCount * 0.75));
+const DEFAULT_FILE_IO_CONCURRENCY = 20;
+const DEFAULT_TIMEOUT_MS = 45_000;
+const DEFAULT_RETRIES = 2;
+const DEFAULT_RETRY_DELAY_MS = 1_000;
+const DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_CACHE_CLEANUP_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+const PROGRESS_LOG_INTERVAL = 10;
 
 const CACHE_DIR = ".cache";
-const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
-// URL filters to exclude unnecessary URLs
 const URL_FILTERS = {
   excludePatterns: [
-    /\/api\//, // API endpoints
-    /\.xml$/, // Sitemaps
-    /\.rss$/, // RSS feeds
-    /\.json$/, // JSON endpoints
-    /\/wp-json\//, // WordPress API
-    /\/admin\//, // Admin panels
+    /\/api\//,
+    /\.xml$/,
+    /\.rss$/,
+    /\.json$/,
+    /\/wp-json\//,
+    /\/admin\//,
   ],
 };
 
-/**
- * Fetches URLs from a sitemap.
- * @param sitemapUrl - The URL of the sitemap.
- * @returns A promise that resolves to an array of URLs.
- */
-async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
+interface ScriptConfig {
+  screenshotConcurrency: number;
+  comparisonConcurrency: number;
+  fileIoConcurrency: number;
+  timeoutMs: number;
+  retries: number;
+  retryDelayMs: number;
+  cacheTtlMs: number;
+  cacheCleanupAgeMs: number;
+  maxUrls?: number;
+  noCache: boolean;
+}
+
+interface RuntimeLimiters {
+  comparisonLimiter: ReturnType<typeof pLimit>;
+  fileIoLimiter: ReturnType<typeof pLimit>;
+}
+
+function printHelp(): void {
+  console.log(`Usage:
+  deno run --env-file=.env --allow-all compare-prod-and-preview.ts <sitemap_url> [preview_domain] [options]
+
+Options:
+  --concurrency <n>             Screenshot concurrency (default: ${DEFAULT_SCREENSHOT_CONCURRENCY})
+  --comparison-concurrency <n>  Pixel comparison concurrency (default: ${DEFAULT_COMPARISON_CONCURRENCY})
+  --file-io-concurrency <n>     File write concurrency (default: ${DEFAULT_FILE_IO_CONCURRENCY})
+  --timeout-ms <ms>             Request timeout in milliseconds (default: ${DEFAULT_TIMEOUT_MS})
+  --retries <n>                 Retries for sitemap/screenshot requests (default: ${DEFAULT_RETRIES})
+  --retry-delay-ms <ms>         Base retry delay (default: ${DEFAULT_RETRY_DELAY_MS})
+  --cache-ttl-ms <ms>           Cached prod screenshot TTL (default: ${DEFAULT_CACHE_TTL_MS})
+  --cache-cleanup-age-ms <ms>   Remove cache files older than this (default: ${DEFAULT_CACHE_CLEANUP_AGE_MS})
+  --max-urls <n>                Process at most n filtered URLs
+  --no-cache                    Disable prod screenshot cache for this run
+  --help, -h                    Show this help
+`);
+}
+
+function parsePositiveInt(
+  value: string | undefined,
+  flagName: string,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Invalid value for --${flagName}: ${value}`);
+  }
+
+  return parsed;
+}
+
+function normalizePreviewDomain(
+  previewDomain: string | undefined,
+): string | null {
+  if (!previewDomain) {
+    return null;
+  }
+
   try {
-    console.log(`Fetching sitemap from ${sitemapUrl}...`);
-
-    // Use Deno.Command to use curl with SSL certificate bypass
-    const command = new Deno.Command("curl", {
-      args: [
-        "-k", // Ignore SSL certificate errors
-        "-s", // Silent mode
-        sitemapUrl,
-      ],
-    });
-
-    const { code, stdout, stderr } = await command.output();
-
-    if (code !== 0) {
-      console.error(
-        `Failed to fetch sitemap. Error: ${new TextDecoder().decode(stderr)}`,
-      );
-      return [];
-    }
-
-    const data = new TextDecoder().decode(stdout);
-    console.log("Received sitemap data, parsing...");
-
-    const $ = cheerio.load(data, { xmlMode: true });
-    const urls: string[] = [];
-
-    // Try different selectors for different sitemap formats
-    $("url loc, sitemap loc, urlset url").each((_, element) => {
-      const loc = $(element).text().trim();
-      if (loc) {
-        urls.push(loc);
-      }
-    });
-
-    if (urls.length === 0) {
-      console.log("Raw sitemap content:", data);
-    }
-
-    return urls;
-  } catch (error) {
-    console.error(`Error fetching sitemap:`, error);
-    return [];
+    return new URL(previewDomain).toString();
+  } catch {
+    return `https://${previewDomain}`;
   }
 }
 
-/**
- * Checks if a URL should be tested based on filter patterns.
- * @param url - The URL to check.
- * @returns True if the URL should be tested, false otherwise.
- */
+function getScriptConfig(args: string[]): {
+  sitemapUrl?: string;
+  previewDomain: string | null;
+  help: boolean;
+  config: ScriptConfig;
+} {
+  const parsedArgs = parseArgs({
+    args,
+    allowPositionals: true,
+    options: {
+      help: { type: "boolean", short: "h" },
+      concurrency: { type: "string" },
+      "comparison-concurrency": { type: "string" },
+      "file-io-concurrency": { type: "string" },
+      "timeout-ms": { type: "string" },
+      retries: { type: "string" },
+      "retry-delay-ms": { type: "string" },
+      "cache-ttl-ms": { type: "string" },
+      "cache-cleanup-age-ms": { type: "string" },
+      "max-urls": { type: "string" },
+      "no-cache": { type: "boolean" },
+    },
+  });
+
+  const screenshotConcurrency = parsePositiveInt(
+    parsedArgs.values.concurrency,
+    "concurrency",
+  ) ?? DEFAULT_SCREENSHOT_CONCURRENCY;
+  const comparisonConcurrency = parsePositiveInt(
+    parsedArgs.values["comparison-concurrency"],
+    "comparison-concurrency",
+  ) ?? DEFAULT_COMPARISON_CONCURRENCY;
+  const fileIoConcurrency = parsePositiveInt(
+    parsedArgs.values["file-io-concurrency"],
+    "file-io-concurrency",
+  ) ?? DEFAULT_FILE_IO_CONCURRENCY;
+  const timeoutMs =
+    parsePositiveInt(parsedArgs.values["timeout-ms"], "timeout-ms") ??
+      DEFAULT_TIMEOUT_MS;
+  const retries = parsePositiveInt(parsedArgs.values.retries, "retries") ??
+    DEFAULT_RETRIES;
+  const retryDelayMs = parsePositiveInt(
+    parsedArgs.values["retry-delay-ms"],
+    "retry-delay-ms",
+  ) ?? DEFAULT_RETRY_DELAY_MS;
+  const cacheTtlMs = parsePositiveInt(
+    parsedArgs.values["cache-ttl-ms"],
+    "cache-ttl-ms",
+  ) ?? DEFAULT_CACHE_TTL_MS;
+  const cacheCleanupAgeMs = parsePositiveInt(
+    parsedArgs.values["cache-cleanup-age-ms"],
+    "cache-cleanup-age-ms",
+  ) ?? DEFAULT_CACHE_CLEANUP_AGE_MS;
+  const maxUrls = parsePositiveInt(parsedArgs.values["max-urls"], "max-urls");
+
+  return {
+    sitemapUrl: parsedArgs.positionals[0],
+    previewDomain: normalizePreviewDomain(parsedArgs.positionals[1]),
+    help: parsedArgs.values.help ?? false,
+    config: {
+      screenshotConcurrency,
+      comparisonConcurrency,
+      fileIoConcurrency,
+      timeoutMs,
+      retries,
+      retryDelayMs,
+      cacheTtlMs,
+      cacheCleanupAgeMs,
+      maxUrls,
+      noCache: parsedArgs.values["no-cache"] ?? false,
+    },
+  };
+}
+
 function shouldTestUrl(url: string): boolean {
   return !URL_FILTERS.excludePatterns.some((pattern) => pattern.test(url));
 }
 
-/**
- * Gets a cached production screenshot if available and not expired.
- * @param filename - The filename for the screenshot.
- * @returns The cached screenshot buffer or null if not available/expired.
- */
 async function getCachedProdScreenshot(
   filename: string,
+  cacheTtlMs: number,
 ): Promise<Buffer | null> {
   const cachePath = path.join(CACHE_DIR, `${filename}_prod.png`);
 
@@ -119,7 +201,7 @@ async function getCachedProdScreenshot(
     const stats = await fsPromises.stat(cachePath);
     const age = Date.now() - stats.mtimeMs;
 
-    if (age < CACHE_TTL) {
+    if (age < cacheTtlMs) {
       console.log(`✓ Using cached prod screenshot for ${filename}`);
       return await fsPromises.readFile(cachePath);
     }
@@ -130,11 +212,6 @@ async function getCachedProdScreenshot(
   return null;
 }
 
-/**
- * Caches a production screenshot.
- * @param filename - The filename for the screenshot.
- * @param buffer - The screenshot buffer to cache.
- */
 async function cacheProdScreenshot(
   filename: string,
   buffer: Buffer,
@@ -144,63 +221,70 @@ async function cacheProdScreenshot(
   await fsPromises.writeFile(cachePath, buffer);
 }
 
-/**
- * Cleans up old cache files.
- * @param maxAgeMs - Maximum age in milliseconds for cache files to keep.
- */
-async function cleanOldCache(
-  maxAgeMs: number = 7 * 24 * 60 * 60 * 1000,
-): Promise<void> {
+async function cleanOldCache(maxAgeMs: number): Promise<void> {
   try {
     const files = await fsPromises.readdir(CACHE_DIR);
     const now = Date.now();
 
-    for (const file of files) {
-      const filePath = path.join(CACHE_DIR, file);
-      const stats = await fsPromises.stat(filePath);
-      const age = now - stats.mtimeMs;
+    await Promise.all(
+      files.map(async (file) => {
+        const filePath = path.join(CACHE_DIR, file);
+        const stats = await fsPromises.stat(filePath);
+        const age = now - stats.mtimeMs;
 
-      if (age > maxAgeMs) {
-        await fsPromises.unlink(filePath);
-        console.log(`Deleted old cache file: ${file}`);
-      }
-    }
+        if (age > maxAgeMs) {
+          await fsPromises.unlink(filePath);
+          console.log(`Deleted old cache file: ${file}`);
+        }
+      }),
+    );
   } catch {
-    // Cache directory doesn't exist yet
+    // Cache directory does not exist yet
   }
 }
 
-/**
- * Runs a visual test comparing production and preview environments for a given URL.
- * @param prodUrl - The production URL to test.
- * @param previewDomain - The preview domain to compare against.
- * @param getErrorNumber - Callback function to get the next error number.
- * @param failedUrls - Array to track failed URLs.
- * @returns True if visual changes were detected, false otherwise.
- */
+function getScreenshotOptions(config: ScriptConfig): ScreenshotOptions {
+  return {
+    timeoutMs: config.timeoutMs,
+    retries: config.retries,
+    retryDelayMs: config.retryDelayMs,
+  };
+}
+
 async function runVisualTest(
   prodUrl: string,
-  previewDomain: string,
+  previewDomain: string | null,
   getErrorNumber: () => number,
   failedUrls: FailedUrl[],
+  config: ScriptConfig,
+  limiters: RuntimeLimiters,
 ): Promise<boolean> {
   try {
     const filename = urlToFilename(prodUrl);
     const previewUrl = transformUrl(prodUrl, previewDomain);
+    const screenshotOptions = getScreenshotOptions(config);
 
-    // Check cache for prod screenshot only (preview is always fresh)
-    let prodScreenshot = await getCachedProdScreenshot(filename);
-
-    if (!prodScreenshot) {
-      prodScreenshot = await takeScreenshot(prodUrl);
-      await cacheProdScreenshot(filename, prodScreenshot);
+    let prodScreenshot: Buffer | null = null;
+    if (!config.noCache) {
+      prodScreenshot = await getCachedProdScreenshot(
+        filename,
+        config.cacheTtlMs,
+      );
     }
 
-    // Always take fresh preview screenshot
-    const previewScreenshot = await takeScreenshot(previewUrl);
+    if (!prodScreenshot) {
+      prodScreenshot = await takeScreenshot(prodUrl, screenshotOptions);
+      if (!config.noCache) {
+        await cacheProdScreenshot(filename, prodScreenshot);
+      }
+    }
 
-    // Save screenshots with file I/O limiter (using async version)
-    await fileIoLimiter(() =>
+    const previewScreenshot = await takeScreenshot(
+      previewUrl,
+      screenshotOptions,
+    );
+
+    await limiters.fileIoLimiter(() =>
       saveComparisonScreenshotsAsync(
         filename,
         prodScreenshot,
@@ -208,37 +292,26 @@ async function runVisualTest(
       )
     );
 
-    // Compare screenshots with comparison limiter (auto-resize if dimensions differ)
-    const diffPixels = await comparisonLimiter(() =>
-      compareScreenshots(
-        prodScreenshot,
-        previewScreenshot,
-        true, // handleDifferentSizes: auto-resize to match dimensions
-      )
+    const diffPixels = await limiters.comparisonLimiter(() =>
+      compareScreenshots(prodScreenshot, previewScreenshot, true)
     );
 
-    // Create diff image only if differences are detected
     if (diffPixels > 0) {
       await createDiffImage(prodScreenshot, previewScreenshot, filename);
-      console.log(
-        `✗ Changes: ${prodUrl} (${diffPixels} pixels)`,
-      );
+      console.log(`✗ Changes: ${prodUrl} (${diffPixels} pixels)`);
       return true;
-    } else {
-      console.log(`✓ No changes: ${prodUrl}`);
-      return false;
     }
+
+    console.log(`✓ No changes: ${prodUrl}`);
+    return false;
   } catch (error) {
-    // Log error to dedicated error log file (no console output)
     const errorNumber = getErrorNumber();
     logVisualTestError(prodUrl, error, errorNumber);
 
-    // Track failed URL
-    const errorType = classifyError(error);
     failedUrls.push({
       url: prodUrl,
-      errorType,
-      message: error?.message || String(error),
+      errorType: classifyError(error),
+      message: getErrorMessage(error),
       timestamp: new Date().toISOString(),
     });
 
@@ -246,21 +319,7 @@ async function runVisualTest(
   }
 }
 
-/**
- * Main function to run the visual tests.
- * Sample run: deno --allow-all compare-prod-and-preview.ts https://zu.com/sitemap-0.xml deploy-preview-385--zuc-web.netlify.app
- */
-async function main() {
-  const [sitemapUrl, previewDomain] = process.argv.slice(2);
-
-  if (!sitemapUrl) {
-    console.error("Please provide a sitemap URL as a command-line argument.");
-    process.exit(1);
-  }
-
-  await ensureDirectoriesExistAsync();
-
-  // Initialize error log file with header
+async function initializeErrorLog(): Promise<void> {
   await fsPromises.writeFile(
     "./visual-test-errors.log",
     `╔══════════════════════════════════════════════════════════════╗
@@ -268,23 +327,76 @@ async function main() {
 ║           Started: ${new Date().toISOString()}                 ║
 ╚══════════════════════════════════════════════════════════════╝
 
-`
+`,
   );
+}
 
-  // Clean old cache files (older than 7 days)
-  await cleanOldCache();
-
-  console.log(`Screenshot concurrency: ${SCREENSHOT_CONCURRENCY}`);
-  console.log(`Comparison concurrency: ${COMPARISON_CONCURRENCY}`);
-  console.log(`File I/O concurrency: ${FILE_IO_CONCURRENCY}`);
+/**
+ * Main function to run the visual tests.
+ */
+async function main(): Promise<number> {
+  let parsedConfig;
 
   try {
-    const urlsFromSitemap = await fetchSitemapUrls(sitemapUrl);
-    const uniqueUrls = [...new Set(urlsFromSitemap)];
-    const filteredUrls = uniqueUrls.filter((url) => shouldTestUrl(url));
+    parsedConfig = getScriptConfig(process.argv.slice(2));
+  } catch (error) {
+    console.error(getErrorMessage(error));
+    printHelp();
+    return 1;
+  }
+
+  if (parsedConfig.help) {
+    printHelp();
+    return 0;
+  }
+
+  const { sitemapUrl, previewDomain, config } = parsedConfig;
+
+  if (!sitemapUrl) {
+    console.error(
+      "Please provide a sitemap URL as the first positional argument.",
+    );
+    printHelp();
+    return 1;
+  }
+
+  await ensureDirectoriesExistAsync();
+  await initializeErrorLog();
+  await cleanOldCache(config.cacheCleanupAgeMs);
+
+  console.log(`Screenshot concurrency: ${config.screenshotConcurrency}`);
+  console.log(`Comparison concurrency: ${config.comparisonConcurrency}`);
+  console.log(`File I/O concurrency: ${config.fileIoConcurrency}`);
+  console.log(`Timeout: ${config.timeoutMs}ms, retries: ${config.retries}`);
+
+  const screenshotLimiter = pLimit(config.screenshotConcurrency);
+  const comparisonLimiter = pLimit(config.comparisonConcurrency);
+  const fileIoLimiter = pLimit(config.fileIoConcurrency);
+
+  try {
+    const urlsFromSitemap = await fetchSitemapUrls(sitemapUrl, {
+      timeoutMs: config.timeoutMs,
+      retries: config.retries,
+      retryDelayMs: config.retryDelayMs,
+    });
+
+    if (urlsFromSitemap.length === 0) {
+      console.error("No URLs discovered from sitemap. Exiting.");
+      return 1;
+    }
+
+    const filteredUrls = urlsFromSitemap.filter((url) => shouldTestUrl(url));
+    const targetUrls = config.maxUrls
+      ? filteredUrls.slice(0, config.maxUrls)
+      : filteredUrls;
+
+    if (targetUrls.length === 0) {
+      console.error("No URLs remained after filtering. Exiting.");
+      return 1;
+    }
 
     console.log(
-      `Processing ${filteredUrls.length} URLs (filtered from ${uniqueUrls.length})`,
+      `Processing ${targetUrls.length} URLs (filtered from ${urlsFromSitemap.length})`,
     );
 
     let processed = 0;
@@ -293,32 +405,42 @@ async function main() {
     const failedUrls: FailedUrl[] = [];
     const startTime = Date.now();
 
-    const tasks = filteredUrls.map((url) =>
+    const tasks = targetUrls.map((url) =>
       screenshotLimiter(async () => {
         const hadChanges = await runVisualTest(
           url,
           previewDomain,
           () => {
-            // Error callback: increment error count and return the error number
             errorCount++;
             return errorCount;
           },
           failedUrls,
+          config,
+          { comparisonLimiter, fileIoLimiter },
         );
-        if (hadChanges) withChanges++;
+
+        if (hadChanges) {
+          withChanges++;
+        }
+
         processed++;
 
-        // Log progress every 10 URLs or on completion
-        const shouldLog = processed % 10 === 0 || processed === filteredUrls.length;
+        const shouldLog = processed % PROGRESS_LOG_INTERVAL === 0 ||
+          processed === targetUrls.length;
 
         if (shouldLog) {
-          const elapsed = (Date.now() - startTime) / 1000;
-          const rate = processed / elapsed;
-          const remaining = filteredUrls.length > processed
-            ? (filteredUrls.length - processed) / rate
+          const elapsed = (Date.now() - startTime) / 1_000;
+          const rate = processed / Math.max(elapsed, 1);
+          const remaining = targetUrls.length > processed
+            ? (targetUrls.length - processed) / Math.max(rate, 0.1)
             : 0;
+
           console.log(
-            `Progress: ${processed}/${filteredUrls.length} (${rate.toFixed(2)} URLs/sec${remaining > 0 ? `, ~${Math.floor(remaining)}s remaining` : ''})`,
+            `Progress: ${processed}/${targetUrls.length} (${
+              rate.toFixed(2)
+            } URLs/sec${
+              remaining > 0 ? `, ~${Math.floor(remaining)}s remaining` : ""
+            })`,
           );
         }
       })
@@ -326,14 +448,15 @@ async function main() {
 
     await Promise.all(tasks);
 
-    const totalTime = (Date.now() - startTime) / 1000;
-    console.log(`\n=== Summary ===`);
+    const totalTime = (Date.now() - startTime) / 1_000;
+    console.log("\n=== Summary ===");
     console.log(`Processed: ${processed} URLs`);
     console.log(`With changes: ${withChanges}`);
     console.log(`Time: ${totalTime.toFixed(2)}s`);
-    console.log(`Rate: ${(processed / totalTime).toFixed(2)} URLs/sec`);
+    console.log(
+      `Rate: ${(processed / Math.max(totalTime, 1)).toFixed(2)} URLs/sec`,
+    );
 
-    // Write error summary if there were any failures
     if (failedUrls.length > 0) {
       writeErrorSummary({
         totalUrls: processed,
@@ -341,11 +464,21 @@ async function main() {
         urlsFailed: failedUrls.length,
         failedUrls,
       });
-      console.log(`\n⚠️  ${failedUrls.length} URL(s) failed. See visual-test-errors.log for details.`);
+      console.log(
+        `\n⚠️  ${failedUrls.length} URL(s) failed. See visual-test-errors.log for details.`,
+      );
     }
+
+    return 0;
   } catch (error) {
-    console.error(`Error running visual tests:`, error);
+    console.error(`Error running visual tests: ${getErrorMessage(error)}`);
+    return 1;
   }
 }
 
-main().catch(console.error);
+if (import.meta.main) {
+  const code = await main();
+  if (code !== 0) {
+    process.exit(code);
+  }
+}

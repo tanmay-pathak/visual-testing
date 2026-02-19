@@ -1,171 +1,210 @@
 import pLimit from "p-limit";
-import * as cheerio from "cheerio";
 import process from "node:process";
-import fs from "node:fs";
 import path from "node:path";
+import { parseArgs } from "node:util";
+import { promises as fsPromises } from "node:fs";
+import { fetchSitemapUrls } from "./sitemap-utils.ts";
 import {
+  ensureDirectoriesExistAsync,
+  getErrorMessage,
+  logError,
+  type ScreenshotOptions,
+  SCREENSHOTS_DIR,
   takeScreenshot,
   urlToFilename,
-  ensureDirectoriesExist,
-  logError,
-  SCREENSHOTS_DIR,
 } from "./visual-testing-utils.ts";
 
-// Reference Deno types for Deno.Command if used in this script
-/// <reference types="https://deno.land/x/deno_node/v22.0.0/src/node/process.d.ts" />
+const DEFAULT_CONCURRENCY = 5;
+const DEFAULT_TIMEOUT_MS = 45_000;
+const DEFAULT_RETRIES = 2;
+const DEFAULT_RETRY_DELAY_MS = 1_000;
 
-const CONCURRENCY_LIMIT = 5;
-
-/**
- * Fetches URLs from a sitemap.
- * @param sitemapUrl - The URL of the sitemap.
- * @returns A promise that resolves to an array of URLs.
- */
-async function fetchSitemapUrls(sitemapUrl: string): Promise<string[]> {
-  try {
-    console.log(`Fetching sitemap from ${sitemapUrl}...`);
-
-    // Use Deno.Command to use curl with SSL certificate bypass
-    // Ensure this script is run with Deno and appropriate permissions (--allow-run)
-    // @ts-ignore: Deno types might not be recognized by all editors
-    const command = new Deno.Command("curl", {
-      args: [
-        "-k", // Ignore SSL certificate errors
-        "-s", // Silent mode
-        sitemapUrl,
-      ],
-    });
-
-    // @ts-ignore: Deno types might not be recognized by all editors
-    const { code, stdout, stderr } = await command.output();
-
-    if (code !== 0) {
-      const errorOutput = new TextDecoder().decode(stderr);
-      console.error(
-        `Failed to fetch sitemap. Exit code: ${code}. Error: ${errorOutput}`
-      );
-      logError(`Failed to fetch sitemap ${sitemapUrl}`, errorOutput);
-      return [];
-    }
-
-    const data = new TextDecoder().decode(stdout);
-    console.log("Received sitemap data, parsing...");
-
-    const $ = cheerio.load(data, { xmlMode: true });
-    const urls: string[] = [];
-
-    // Try different selectors for different sitemap formats
-    $("url loc, sitemap loc, urlset url loc").each((_, element) => {
-      const loc = $(element).text().trim();
-      if (loc) {
-        urls.push(loc);
-      }
-    });
-
-    // If the primary sitemap contains links to other sitemaps, fetch them recursively
-    const sitemapLinks = $("sitemap > loc")
-      .map((_, el) => $(el).text().trim())
-      .get();
-    if (sitemapLinks.length > 0 && urls.length === 0) {
-      // Avoid infinite loops for malformed sitemaps referencing themselves
-      console.log(
-        `Found ${sitemapLinks.length} nested sitemaps. Fetching URLs from them...`
-      );
-      const nestedUrlsPromises = sitemapLinks.map((link) =>
-        fetchSitemapUrls(link)
-      );
-      const nestedUrlsArrays = await Promise.all(nestedUrlsPromises);
-      nestedUrlsArrays.forEach((nestedUrls) => urls.push(...nestedUrls));
-    }
-
-    if (urls.length === 0) {
-      console.warn(`No URLs found in sitemap: ${sitemapUrl}`);
-      console.log("Raw sitemap content sample:", data.substring(0, 500));
-    } else {
-      console.log(`Found ${urls.length} URLs in ${sitemapUrl}.`);
-    }
-
-    return urls;
-  } catch (error) {
-    logError(`Error fetching sitemap ${sitemapUrl}`, error);
-    return [];
-  }
+interface ScriptConfig {
+  sitemapUrl?: string;
+  concurrency: number;
+  timeoutMs: number;
+  retries: number;
+  retryDelayMs: number;
+  maxUrls?: number;
+  help: boolean;
 }
 
-/**
- * Takes a screenshot for a given URL and saves it.
- * @param url - The URL to take a screenshot of.
- */
-async function takeAndSaveScreenshot(url: string): Promise<void> {
+function printHelp(): void {
+  console.log(`Usage:
+  deno run --env-file=.env --allow-all take-sitemap-screenshots.ts <sitemap_url> [options]
+
+Options:
+  --concurrency <n>      Number of parallel screenshots (default: ${DEFAULT_CONCURRENCY})
+  --timeout-ms <ms>      Request timeout in milliseconds (default: ${DEFAULT_TIMEOUT_MS})
+  --retries <n>          Retries for sitemap/screenshot requests (default: ${DEFAULT_RETRIES})
+  --retry-delay-ms <ms>  Base retry delay (default: ${DEFAULT_RETRY_DELAY_MS})
+  --max-urls <n>         Process at most n URLs
+  --help, -h             Show this help
+`);
+}
+
+function parsePositiveInt(
+  value: string | undefined,
+  flagName: string,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Invalid value for --${flagName}: ${value}`);
+  }
+
+  return parsed;
+}
+
+function getScriptConfig(args: string[]): ScriptConfig {
+  const parsedArgs = parseArgs({
+    args,
+    allowPositionals: true,
+    options: {
+      help: { type: "boolean", short: "h" },
+      concurrency: { type: "string" },
+      "timeout-ms": { type: "string" },
+      retries: { type: "string" },
+      "retry-delay-ms": { type: "string" },
+      "max-urls": { type: "string" },
+    },
+  });
+
+  return {
+    sitemapUrl: parsedArgs.positionals[0],
+    concurrency:
+      parsePositiveInt(parsedArgs.values.concurrency, "concurrency") ??
+        DEFAULT_CONCURRENCY,
+    timeoutMs:
+      parsePositiveInt(parsedArgs.values["timeout-ms"], "timeout-ms") ??
+        DEFAULT_TIMEOUT_MS,
+    retries: parsePositiveInt(parsedArgs.values.retries, "retries") ??
+      DEFAULT_RETRIES,
+    retryDelayMs: parsePositiveInt(
+      parsedArgs.values["retry-delay-ms"],
+      "retry-delay-ms",
+    ) ?? DEFAULT_RETRY_DELAY_MS,
+    maxUrls: parsePositiveInt(parsedArgs.values["max-urls"], "max-urls"),
+    help: parsedArgs.values.help ?? false,
+  };
+}
+
+function getScreenshotOptions(config: ScriptConfig): ScreenshotOptions {
+  return {
+    timeoutMs: config.timeoutMs,
+    retries: config.retries,
+    retryDelayMs: config.retryDelayMs,
+  };
+}
+
+async function takeAndSaveScreenshot(
+  url: string,
+  screenshotOptions: ScreenshotOptions,
+): Promise<boolean> {
   try {
-    const screenshotBuffer = await takeScreenshot(url);
+    const screenshotBuffer = await takeScreenshot(url, screenshotOptions);
     const filename = urlToFilename(url);
     const outputPath = path.join(SCREENSHOTS_DIR, `${filename}.png`);
-    fs.writeFileSync(outputPath, screenshotBuffer);
+    await fsPromises.writeFile(outputPath, screenshotBuffer);
     console.log(`Screenshot saved for ${url} at ${outputPath}`);
+    return true;
   } catch (error) {
     logError(`Failed to take or save screenshot for ${url}`, error);
-    // Continue with other URLs even if one fails
+    return false;
   }
 }
 
 /**
  * Main function to run the screenshot process.
- * Sample run: deno run --allow-net --allow-read --allow-write --allow-run --allow-env take-sitemap-screenshots.ts https://example.com/sitemap.xml
  */
-async function main() {
-  // Ensure environment variables are loaded if using a .env file
-  // Example: await config({ export: true });
-
+async function main(): Promise<number> {
   if (!process.env.BASE_URL || !process.env.API_TOKEN) {
     console.error(
-      "Error: BASE_URL and API_TOKEN environment variables are required."
+      "Error: BASE_URL and API_TOKEN environment variables are required.",
     );
-    console.log("Please set them directly or use a .env file.");
-    process.exit(1);
+    return 1;
   }
 
-  const [sitemapUrl] = process.argv.slice(2);
+  let config: ScriptConfig;
+  try {
+    config = getScriptConfig(process.argv.slice(2));
+  } catch (error) {
+    console.error(getErrorMessage(error));
+    printHelp();
+    return 1;
+  }
 
-  if (!sitemapUrl) {
-    console.error("Please provide a sitemap URL as a command-line argument.");
+  if (config.help) {
+    printHelp();
+    return 0;
+  }
+
+  if (!config.sitemapUrl) {
     console.error(
-      "Example: deno run --allow-all take-sitemap-screenshots.ts https://example.com/sitemap.xml"
+      "Please provide a sitemap URL as the first positional argument.",
     );
-    process.exit(1);
+    printHelp();
+    return 1;
   }
 
-  console.log(`Starting screenshot process for sitemap: ${sitemapUrl}`);
+  console.log(`Starting screenshot process for sitemap: ${config.sitemapUrl}`);
+  console.log(
+    `Concurrency: ${config.concurrency}, timeout: ${config.timeoutMs}ms, retries: ${config.retries}`,
+  );
 
-  ensureDirectoriesExist(); // Ensures SCREENSHOTS_DIR exists
-  const limit = pLimit(CONCURRENCY_LIMIT);
+  await ensureDirectoriesExistAsync();
+  const limit = pLimit(config.concurrency);
 
   try {
-    const urlsFromSitemap = await fetchSitemapUrls(sitemapUrl);
-    const uniqueUrls = [...new Set(urlsFromSitemap)]; // Remove duplicates
+    const urlsFromSitemap = await fetchSitemapUrls(config.sitemapUrl, {
+      timeoutMs: config.timeoutMs,
+      retries: config.retries,
+      retryDelayMs: config.retryDelayMs,
+      maxUrls: config.maxUrls,
+    });
 
-    if (uniqueUrls.length === 0) {
+    if (urlsFromSitemap.length === 0) {
       console.error("No URLs found from the sitemap. Exiting.");
-      process.exit(1);
+      return 1;
     }
 
     console.log(
-      `Found ${uniqueUrls.length} unique URLs. Taking screenshots with concurrency limit ${CONCURRENCY_LIMIT}...`
+      `Found ${urlsFromSitemap.length} unique URLs. Taking screenshots with concurrency limit ${config.concurrency}...`,
     );
 
-    const tasks = uniqueUrls.map((url) =>
-      limit(() => takeAndSaveScreenshot(url))
+    const screenshotOptions = getScreenshotOptions(config);
+    let failedCount = 0;
+
+    const tasks = urlsFromSitemap.map((url) =>
+      limit(async () => {
+        const success = await takeAndSaveScreenshot(url, screenshotOptions);
+        if (!success) {
+          failedCount++;
+        }
+      })
     );
 
     await Promise.all(tasks);
+
+    if (failedCount > 0) {
+      console.error(`Completed with ${failedCount} failed URL(s).`);
+      return 1;
+    }
+
     console.log("Screenshot process completed.");
+    return 0;
   } catch (error) {
-    logError("An error occurred during the main process", error);
-    process.exit(1);
+    logError("An error occurred during the screenshot process", error);
+    return 1;
   }
 }
 
-main().catch((error) => {
-  logError("Unhandled error in main execution", error);
-  process.exit(1);
-});
+if (import.meta.main) {
+  const code = await main();
+  if (code !== 0) {
+    process.exit(code);
+  }
+}
