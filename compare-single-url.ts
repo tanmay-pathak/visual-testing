@@ -1,6 +1,7 @@
 import process from "node:process";
 import { parseArgs } from "node:util";
 import {
+  createRunSubdirectory,
   getErrorMessage,
   performUrlComparison,
 } from "./visual-testing-utils.ts";
@@ -17,6 +18,7 @@ Options:
   --timeout-ms <ms>      Request timeout in milliseconds (default: ${DEFAULT_TIMEOUT_MS})
   --retries <n>          Retries for screenshot requests (default: ${DEFAULT_RETRIES})
   --retry-delay-ms <ms>  Base retry delay (default: ${DEFAULT_RETRY_DELAY_MS})
+  --run-name <name>      Optional label for the run output folder
   --help, -h             Show this help
 `);
 }
@@ -52,6 +54,7 @@ async function main(): Promise<number> {
         "timeout-ms": { type: "string" },
         retries: { type: "string" },
         "retry-delay-ms": { type: "string" },
+        "run-name": { type: "string" },
       },
     });
   } catch (error) {
@@ -75,6 +78,13 @@ async function main(): Promise<number> {
   }
 
   try {
+    const runChangesDir = await createRunSubdirectory(
+      "changes",
+      "single-url",
+      parsedArgs.values["run-name"],
+    );
+    console.log(`Diff output directory: ${runChangesDir}`);
+
     await performUrlComparison(url1, url2, {
       timeoutMs:
         parsePositiveInt(parsedArgs.values["timeout-ms"], "timeout-ms") ??
@@ -85,7 +95,7 @@ async function main(): Promise<number> {
         parsedArgs.values["retry-delay-ms"],
         "retry-delay-ms",
       ) ?? DEFAULT_RETRY_DELAY_MS,
-    });
+    }, runChangesDir);
 
     return 0;
   } catch (error) {

@@ -7,6 +7,7 @@ import { parseArgs } from "node:util";
 import {
   compareScreenshots,
   createDiffImageWithPath,
+  createRunSubdirectory,
   getErrorMessage,
   type ScreenshotOptions,
   takeScreenshot,
@@ -28,6 +29,7 @@ Options:
   --timeout-ms <ms>      Request timeout in milliseconds (default: ${DEFAULT_TIMEOUT_MS})
   --retries <n>          Retries for screenshot requests (default: ${DEFAULT_RETRIES})
   --retry-delay-ms <ms>  Base retry delay (default: ${DEFAULT_RETRY_DELAY_MS})
+  --run-name <name>      Optional label for the run output folder
   --help, -h             Show this help
 `);
 }
@@ -88,6 +90,7 @@ async function runVisualTest(
   url: string,
   isBaseline: boolean,
   screenshotOptions: ScreenshotOptions,
+  changesOutputDir: string,
 ): Promise<void> {
   const filename = urlToFilename(url);
   const screenshotPath = path.join(SCREENSHOTS_DIR, `${filename}.png`);
@@ -109,7 +112,7 @@ async function runVisualTest(
         oldScreenshot,
         newScreenshot,
         filename,
-        CHANGES_DIR,
+        changesOutputDir,
       );
     } else {
       console.log(`No visual changes detected for ${url}`);
@@ -138,6 +141,7 @@ async function main(): Promise<number> {
         "timeout-ms": { type: "string" },
         retries: { type: "string" },
         "retry-delay-ms": { type: "string" },
+        "run-name": { type: "string" },
       },
     });
   } catch (error) {
@@ -180,6 +184,12 @@ async function main(): Promise<number> {
   }
 
   ensureDirectoriesExist();
+  const runChangesDir = await createRunSubdirectory(
+    CHANGES_DIR,
+    "branch-compare",
+    parsedArgs.values["run-name"],
+  );
+  console.log(`Diff output directory: ${runChangesDir}`);
 
   let originalBranch: string | null = null;
 
@@ -188,10 +198,10 @@ async function main(): Promise<number> {
     originalBranch = getCurrentBranch();
 
     await switchBranch("main");
-    await runVisualTest(url, true, screenshotOptions);
+    await runVisualTest(url, true, screenshotOptions, runChangesDir);
 
     await switchBranch(branchName);
-    await runVisualTest(url, false, screenshotOptions);
+    await runVisualTest(url, false, screenshotOptions, runChangesDir);
 
     return 0;
   } catch (error) {

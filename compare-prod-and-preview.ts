@@ -10,6 +10,7 @@ import {
   classifyError,
   compareScreenshots,
   createDiffImage,
+  createRunSubdirectory,
   ensureDirectoriesExistAsync,
   type FailedUrl,
   getErrorMessage,
@@ -57,6 +58,7 @@ interface ScriptConfig {
   cacheCleanupAgeMs: number;
   maxUrls?: number;
   noCache: boolean;
+  runName?: string;
 }
 
 interface RuntimeLimiters {
@@ -78,6 +80,7 @@ Options:
   --cache-ttl-ms <ms>           Cached prod screenshot TTL (default: ${DEFAULT_CACHE_TTL_MS})
   --cache-cleanup-age-ms <ms>   Remove cache files older than this (default: ${DEFAULT_CACHE_CLEANUP_AGE_MS})
   --max-urls <n>                Process at most n filtered URLs
+  --run-name <name>             Optional label for the run output folder
   --no-cache                    Disable prod screenshot cache for this run
   --help, -h                    Show this help
 `);
@@ -133,6 +136,7 @@ function getScriptConfig(args: string[]): {
       "cache-ttl-ms": { type: "string" },
       "cache-cleanup-age-ms": { type: "string" },
       "max-urls": { type: "string" },
+      "run-name": { type: "string" },
       "no-cache": { type: "boolean" },
     },
   });
@@ -182,6 +186,7 @@ function getScriptConfig(args: string[]): {
       cacheTtlMs,
       cacheCleanupAgeMs,
       maxUrls,
+      runName: parsedArgs.values["run-name"],
       noCache: parsedArgs.values["no-cache"] ?? false,
     },
   };
@@ -258,6 +263,7 @@ async function runVisualTest(
   failedUrls: FailedUrl[],
   config: ScriptConfig,
   limiters: RuntimeLimiters,
+  changesOutputDir: string,
 ): Promise<boolean> {
   try {
     const filename = urlToFilename(prodUrl);
@@ -297,7 +303,12 @@ async function runVisualTest(
     );
 
     if (diffPixels > 0) {
-      await createDiffImage(prodScreenshot, previewScreenshot, filename);
+      await createDiffImage(
+        prodScreenshot,
+        previewScreenshot,
+        filename,
+        changesOutputDir,
+      );
       console.log(`✗ Changes: ${prodUrl} (${diffPixels} pixels)`);
       return true;
     }
@@ -363,11 +374,17 @@ async function main(): Promise<number> {
   await ensureDirectoriesExistAsync();
   await initializeErrorLog();
   await cleanOldCache(config.cacheCleanupAgeMs);
+  const runChangesDir = await createRunSubdirectory(
+    "changes",
+    "prod-preview",
+    config.runName,
+  );
 
   console.log(`Screenshot concurrency: ${config.screenshotConcurrency}`);
   console.log(`Comparison concurrency: ${config.comparisonConcurrency}`);
   console.log(`File I/O concurrency: ${config.fileIoConcurrency}`);
   console.log(`Timeout: ${config.timeoutMs}ms, retries: ${config.retries}`);
+  console.log(`Diff output directory: ${runChangesDir}`);
 
   const screenshotLimiter = pLimit(config.screenshotConcurrency);
   const comparisonLimiter = pLimit(config.comparisonConcurrency);
@@ -417,6 +434,7 @@ async function main(): Promise<number> {
           failedUrls,
           config,
           { comparisonLimiter, fileIoLimiter },
+          runChangesDir,
         );
 
         if (hadChanges) {

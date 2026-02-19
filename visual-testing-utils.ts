@@ -154,6 +154,40 @@ export function urlToFilename(url: string): string {
   return url.replace(/[^a-z0-9]/gi, "_").toLowerCase();
 }
 
+function sanitizePathSegment(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function getRunTimestamp(date: Date = new Date()): string {
+  return date
+    .toISOString()
+    .replace(/[:]/g, "-")
+    .replace(/\.\d+z$/i, "z");
+}
+
+/**
+ * Creates a run-specific output directory path under the provided base directory.
+ */
+export async function createRunSubdirectory(
+  baseDir: string,
+  defaultPrefix: string,
+  runName?: string,
+): Promise<string> {
+  await fsPromises.mkdir(baseDir, { recursive: true });
+
+  const prefix = sanitizePathSegment(defaultPrefix) || "run";
+  const customName = runName ? sanitizePathSegment(runName) : "";
+  const namePart = customName ? `${prefix}-${customName}` : prefix;
+  const runDir = path.join(baseDir, `${namePart}-${getRunTimestamp()}`);
+
+  await fsPromises.mkdir(runDir, { recursive: true });
+  return runDir;
+}
+
 /**
  * Takes a screenshot of the given URL using browserless service.
  * @param url - The URL to capture.
@@ -396,8 +430,9 @@ export async function createDiffImage(
   oldImage: Buffer,
   newImage: Buffer,
   filename: string,
+  outputDir: string = CHANGES_DIR,
 ): Promise<void> {
-  await createDiffImageWithPath(oldImage, newImage, filename, CHANGES_DIR);
+  await createDiffImageWithPath(oldImage, newImage, filename, outputDir);
 }
 
 /**
@@ -611,8 +646,9 @@ export function logComparisonResults(
   filename: string,
   screenshot1Path: string,
   screenshot2Path: string,
+  changesOutputDir: string = CHANGES_DIR,
 ): void {
-  const diffPath = path.join(CHANGES_DIR, `${filename}_diff.png`);
+  const diffPath = path.join(changesOutputDir, `${filename}_diff.png`);
 
   if (diffPixels > 0) {
     console.log(`Visual differences detected: ${diffPixels} pixels different`);
@@ -634,6 +670,7 @@ export async function performUrlComparison(
   url1: string,
   url2: string,
   screenshotOptions: ScreenshotOptions = {},
+  changesOutputDir: string = CHANGES_DIR,
 ): Promise<void> {
   ensureDirectoriesExist();
 
@@ -659,13 +696,14 @@ export async function performUrlComparison(
       true,
     );
 
-    await createDiffImage(screenshot1, screenshot2, filename);
+    await createDiffImage(screenshot1, screenshot2, filename, changesOutputDir);
 
     logComparisonResults(
       diffPixels,
       filename,
       screenshot1Path,
       screenshot2Path,
+      changesOutputDir,
     );
   } catch (error) {
     logError("Error comparing URLs", error);

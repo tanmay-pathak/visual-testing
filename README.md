@@ -88,9 +88,25 @@ Script-specific flags include:
 
 - `compare:prod-preview`: `--concurrency`, `--comparison-concurrency`,
   `--file-io-concurrency`, `--cache-ttl-ms`, `--cache-cleanup-age-ms`,
-  `--no-cache`
+  `--no-cache`, `--run-name`
+- `compare:url`: `--run-name`
+- `compare:branches`: `--run-name`
 - `sitemap:screenshots`: `--concurrency`
 - `sitemap:open`: `--concurrency`, `--yes`
+
+## Diff output organization
+
+Visual diff images are written to run-specific subfolders so runs do not mix
+files:
+
+- `compare:prod-preview`:
+  `/Users/tanmay/GitHub/visual-testing/changes/prod-preview-<timestamp>/`
+- `compare:url`:
+  `/Users/tanmay/GitHub/visual-testing/changes/single-url-<timestamp>/`
+- `compare:branches`:
+  `/Users/tanmay/visual-testing-compare/changes/branch-compare-<timestamp>/`
+
+Use `--run-name <name>` to include a readable label in the folder name.
 
 ## Branch compare precondition
 
