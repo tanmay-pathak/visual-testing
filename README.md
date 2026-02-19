@@ -35,12 +35,38 @@ deno task <task-name> <args>
 
 Available tasks:
 
+- `ui`
 - `compare:prod-preview`
 - `compare:url`
 - `compare:branches`
 - `sitemap:screenshots`
 - `sitemap:open`
 - `check`
+- `test`
+
+## Interactive launcher
+
+Run the prompt-based task launcher:
+
+```sh
+deno task ui
+```
+
+Useful launcher flags:
+
+- `--task <task-id>`: preselect a task and skip the menu
+- `--advanced`: show advanced tasks (`check`, `test`) and advanced fields
+- `--dry-run`: print the resolved command without running it
+- `--no-history`: do not read/write saved values for this run
+
+The launcher remembers last-used values per task in:
+`/Users/tanmay/GitHub/visual-testing/.cache/task-launcher-history.json`
+
+Dry-run example:
+
+```sh
+deno task ui --task compare:url --dry-run
+```
 
 ## Usage
 
